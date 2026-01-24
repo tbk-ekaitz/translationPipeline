@@ -12,7 +12,6 @@ from src import (
     DocumentConverter,
     SentenceSegmenter,
     OllamaClient,
-    LlamaCppClient,
     TranslationLLMManager,
     TranslationOrchestrator,
     OutputGenerator
@@ -91,12 +90,13 @@ def main():
     )
     logger.info(f"✓ Russian model ready: {russian_config['model_name']}")
 
-    # Kazakh model (llama.cpp)
+    # Kazakh model (Ollama)
     kazakh_config = config['llm']['kazakh']
-    kazakh_client = LlamaCppClient(
+    kazakh_client = OllamaClient(
+        model_name=kazakh_config['model_name'],
         base_url=kazakh_config['base_url']
     )
-    logger.info(f"✓ Kazakh model ready at {kazakh_config['base_url']}")
+    logger.info(f"✓ Kazakh model ready: {kazakh_config['model_name']}")
 
     # Create LLM manager
     llm_manager = TranslationLLMManager(russian_client, kazakh_client)

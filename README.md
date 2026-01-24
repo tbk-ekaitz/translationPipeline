@@ -39,7 +39,6 @@ Pipeline de conversión y traducción de documentos DOCX/PDF a múltiples idioma
 - Python 3.8+
 - 159GB VRAM (para cargar ambos modelos simultáneamente)
 - Ollama instalado
-- llama.cpp server compilado
 
 ## Instalación
 
@@ -66,29 +65,35 @@ Ollama correrá en `http://localhost:11434` por defecto.
 - `hf.co/t-tech/T-pro-it-2.1-GGUF:Q4_K_M` (versión mejorada)
 - `hf.co/t-tech/T-pro-it-2.0-GGUF:Q6_K` (mayor calidad, más VRAM)
 
-### 3. Configurar modelo Kazajo (KazLLM) con llama.cpp
+### 3. Configurar modelo Kazajo (KazLLM) con Ollama
 
 ```bash
-# Clonar llama.cpp
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-
-# Compilar con soporte CUDA (para GPU)
-make LLAMA_CUDA=1
-
-# Descargar modelo KazLLM GGUF
+# Descargar modelo KazLLM GGUF desde HuggingFace
 wget https://huggingface.co/issai/LLama-3.1-KazLLM-1.0-8B-GGUF4/resolve/main/LLama-3.1-KazLLM-1.0-8B-GGUF4.gguf
+# Renombrar para simplicidad
+mv LLama-3.1-KazLLM-1.0-8B-GGUF4.gguf KazLLM.gguf
 
-# Ejecutar servidor llama.cpp
-./server -m LLama-3.1-KazLLM-1.0-8B-GGUF4.gguf -c 4096 --host 0.0.0.0 --port 8080
+# Crear Modelfile
+cat > Modelfile <<EOF
+FROM KazLLM.gguf
+PARAMETER temperature 0.7
+PARAMETER num_ctx 8192
+EOF
+
+# Crear modelo en Ollama
+ollama create kazllm-local -f Modelfile
+
+# Verificar que funcione
+ollama run kazllm-local
 ```
 
-El servidor correrá en `http://localhost:8080`.
+**Configuración de `num_ctx` (ventana de contexto):**
+- `num_ctx 4096`: Frases cortas (<50 palabras)
+- `num_ctx 8192`: **Recomendado para frases largas** (hasta ~300 palabras)
+- `num_ctx 16384`: Frases muy largas o documentos técnicos complejos
+- **Máximo modelo:** 131072 (no recomendado, desperdicia VRAM)
 
-**Optimización de cuantización:**
-- `GGUF4` (Q4_K_M): Balance calidad/velocidad
-- `GGUF6` (Q6_K): Mayor calidad, más VRAM
-- `GGUF8` (Q8_0): Calidad máxima
+Para frases muy largas, usa `num_ctx 8192` o `16384` para evitar truncamiento.
 
 ### 4. Configurar prompts
 
@@ -188,30 +193,37 @@ sentence.translations['kazakh']   # 'Қазақ тіліне аударма'
 
 ## Configuración avanzada
 
-### Múltiples instancias de modelos
+### Ejecución con Ollama
 
-Para máxima velocidad con 159GB VRAM, puedes ejecutar múltiples instancias:
+Ambos modelos se ejecutan en Ollama (puerto 11434 por defecto):
 
 ```bash
-# Terminal 1: Ollama para Ruso
-ollama run hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M
+# Terminal 1: Mantén Ollama corriendo en background
+# (Ollama maneja ambos modelos automáticamente)
 
-# Terminal 2: llama.cpp para Kazajo
-cd llama.cpp
-./server -m KazLLM.gguf -c 4096 --port 8080
-
-# Terminal 3: Pipeline
-python pipeline.py documento.docx
+# Terminal 2: Ejecutar pipeline
+python pipeline.py input/documento.docx
 ```
 
-### Ajustar URLs en config.yaml
+**Nota:** Ollama carga modelos bajo demanda. El primer batch puede ser más lento mientras carga el modelo en GPU.
+
+### Configuración en config.yaml
+
+Ambos modelos usan Ollama:
 
 ```yaml
 llm:
   russian:
-    base_url: "http://localhost:11434"  # Ollama
+    type: "ollama"
+    model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M"
+    base_url: "http://localhost:11434"
+    batch_size: 32
+
   kazakh:
-    base_url: "http://localhost:8080"   # llama.cpp
+    type: "ollama"
+    model_name: "kazllm-local"
+    base_url: "http://localhost:11434"  # Mismo servidor Ollama
+    batch_size: 48
 ```
 
 ### Optimizar Batch Sizes
@@ -254,15 +266,17 @@ llm:
 
 ### Error: "Ollama API error"
 - Verifica que Ollama esté corriendo: `ollama list`
-- Verifica el modelo: `ollama run hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M`
-
-### Error: "llama.cpp API error"
-- Verifica que el servidor esté activo: `curl http://localhost:8080/health`
-- Revisa logs del servidor llama.cpp
+- Verifica los modelos:
+  ```bash
+  ollama run hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M
+  ollama run kazllm-local
+  ```
+- Revisa logs de Ollama: `ollama logs`
 
 ### Error: "Out of memory"
-- Usa cuantizaciones más agresivas (Q4 en lugar de Q6)
-- Reduce el contexto en llama.cpp: `-c 2048`
+- Usa cuantizaciones más agresivas (Q4 en lugar de Q6/Q8)
+- Reduce `num_ctx` en Modelfile de kazllm-local: `num_ctx 4096` o `2048`
+- Reduce batch sizes en `config.yaml`
 
 ### Traducciones de baja calidad
 - Usa cuantizaciones mayores (Q6_K, Q8_0)
