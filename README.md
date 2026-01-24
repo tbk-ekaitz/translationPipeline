@@ -95,7 +95,54 @@ ollama run kazllm-local
 
 Para frases muy largas, usa `num_ctx 8192` o `16384` para evitar truncamiento.
 
-### 4. Configurar prompts
+### 4. Configurar segmentación inteligente (chunking)
+
+El pipeline **divide automáticamente** frases que excedan el límite de tokens del modelo:
+
+```yaml
+segmentation:
+  max_tokens: 3000  # Para num_ctx=8192 (recomendado)
+```
+
+**Cómo funciona:**
+1. El segmentador estima tokens: `1 token ≈ 0.75 palabras`
+2. Si una frase excede `max_tokens`, se divide automáticamente
+3. Prioridad de corte: `.` > `,` > `;` > `espacio`
+4. Los chunks se traducen por separado y se reunen transparentemente
+5. **Resultado:** El JSON final contiene la frase completa traducida (sin evidencia de chunking)
+
+**Relación num_ctx ↔ max_tokens:**
+| num_ctx | max_tokens | Margen para prompt/output |
+|---------|------------|---------------------------|
+| 4096    | 1500       | ~2500 tokens              |
+| 8192    | 3000       | ~5000 tokens (recomendado)|
+| 16384   | 6000       | ~10000 tokens             |
+
+**CRÍTICO:** Esto **previene pérdida de datos** - ninguna parte del texto se trunca.
+
+**Ejemplo:**
+```
+Input: "Esta es una frase extremadamente larga que supera 3000 tokens, contiene muchísimo texto, y debe dividirse inteligentemente para no perder información."
+
+Chunks internos:
+  [1] "Esta es una frase extremadamente larga que supera 3000 tokens,"
+  [2] "contiene muchísimo texto, y debe dividirse inteligentemente para no perder información."
+
+Output JSON:
+{
+  "id": 1,
+  "original": "Esta es una frase extremadamente larga...",
+  "russian": "Это очень длинное предложение которое превышает 3000 токенов, содержит много текста, и должно быть разумно разделено чтобы не потерять информацию.",
+  "kazakh": "..."
+}
+```
+
+**Logging:**
+```
+✓ Segmented into 50 sentences (3 split into chunks)
+```
+
+### 5. Configurar prompts
 
 Edita `config.yaml` y reemplaza los placeholders con tus prompts reales:
 
