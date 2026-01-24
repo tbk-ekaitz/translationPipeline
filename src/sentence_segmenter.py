@@ -10,6 +10,11 @@ import nltk
 
 # Download required NLTK data on first run
 try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', quiet=True)
+
+try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt', quiet=True)
@@ -46,7 +51,16 @@ class SentenceSegmenter:
         Args:
             max_tokens: Maximum tokens per sentence chunk (default: 3000)
         """
-        self.tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+        # Compatible with both old and new NLTK versions
+        try:
+            self.tokenizer = nltk.data.load('tokenizers/punkt_tab/english/sent_tokenizer.pickle')
+        except LookupError:
+            try:
+                self.tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+            except LookupError:
+                # Fallback to basic sentence tokenizer
+                from nltk.tokenize import sent_tokenize
+                self.tokenizer = type('obj', (object,), {'tokenize': lambda self, text: sent_tokenize(text)})()
         self.max_tokens = max_tokens
 
     def segment(self, markdown_path: str) -> List[Sentence]:
