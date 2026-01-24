@@ -75,9 +75,13 @@ def main():
 
     # Step 2: Sentence Segmentation
     logger.info("Segmenting sentences...")
-    segmenter = SentenceSegmenter()
+    max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
+    segmenter = SentenceSegmenter(max_tokens=max_tokens)
     sentences = segmenter.segment(markdown_path)
-    logger.info(f"✓ Segmented into {len(sentences)} sentences")
+
+    # Count chunked sentences
+    chunked_count = sum(1 for s in sentences if s.chunks)
+    logger.info(f"✓ Segmented into {len(sentences)} sentences ({chunked_count} split into chunks)")
 
     # Step 3: Initialize LLM clients
     logger.info("Initializing LLM clients...")

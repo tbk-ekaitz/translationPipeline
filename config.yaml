@@ -16,6 +16,12 @@ llm:
     base_url: "http://localhost:11434"
     batch_size: 48  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
 
+# Segmentation configuration
+segmentation:
+  # Maximum tokens per sentence before splitting
+  # Safe values: 3000 for num_ctx=8192, 6000 for num_ctx=16384
+  max_tokens: 3000
+
 # Translation prompts (placeholders - replace with your actual prompts)
 prompts:
   russian: |

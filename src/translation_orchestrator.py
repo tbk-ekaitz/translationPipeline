@@ -1,11 +1,12 @@
 """
 Translation orchestrator
-Coordinates the entire translation pipeline
+Coordinates the entire translation pipeline with chunk support
 """
 from typing import List
 from .sentence_segmenter import Sentence
 from .llm_client import TranslationLLMManager
 from tqdm import tqdm
+import re
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +90,7 @@ class TranslationOrchestrator:
         """
         Translate sentences to a specific language in batches
         CRITICAL: Preserves exact order using indices
+        Handles chunked sentences by expanding and merging
 
         Args:
             sentences: List of Sentence objects
@@ -119,21 +121,71 @@ class TranslationOrchestrator:
                 'sentences': f'{start_idx + 1}-{end_idx}/{total}'
             })
 
-            # Extract texts from batch (preserves order)
-            batch_texts = [sent.text for sent in batch_sentences]
+            # Expand chunks for batch
+            batch_items = []
+            chunk_metadata = []
 
-            # Translate entire batch
+            for local_idx, sent in enumerate(batch_sentences):
+                global_idx = start_idx + local_idx  # CRITICAL: Global index
+
+                if sent.chunks:
+                    # Sentence was split, add chunks
+                    batch_items.extend(sent.chunks)
+                    chunk_metadata.append((global_idx, True, len(sent.chunks)))
+                else:
+                    # Normal sentence
+                    batch_items.append(sent.text)
+                    chunk_metadata.append((global_idx, False, 1))
+
+            # Translate entire batch (chunks expanded)
             try:
-                translations = translate_func(batch_texts, prompt_template)
+                translations = translate_func(batch_items, prompt_template)
 
-                # CRITICAL: Assign translations back to correct sentences using index
-                for i, translation in enumerate(translations):
-                    sentence_idx = start_idx + i  # Global index in sentences list
-                    sentences[sentence_idx].add_translation(language, translation)
+                # Merge chunks and assign back to sentences
+                trans_idx = 0
+                for global_idx, is_chunked, num_chunks in chunk_metadata:
+                    if is_chunked:
+                        # Get chunk translations and merge
+                        chunk_trans = translations[trans_idx:trans_idx + num_chunks]
+                        merged = self._merge_chunk_translations(chunk_trans)
+                        sentences[global_idx].add_translation(language, merged)
+                        trans_idx += num_chunks
+                    else:
+                        # Single translation
+                        sentences[global_idx].add_translation(language, translations[trans_idx])
+                        trans_idx += 1
 
             except Exception as e:
                 logger.error(f"  ✗ Batch translation failed: {e}")
                 # On batch failure, mark all sentences in batch with error
-                for i in range(len(batch_sentences)):
-                    sentence_idx = start_idx + i
-                    sentences[sentence_idx].add_translation(language, f"[ERROR: {str(e)}]")
+                for global_idx, _, _ in chunk_metadata:
+                    sentences[global_idx].add_translation(language, f"[ERROR: {str(e)}]")
+
+    @staticmethod
+    def _merge_chunk_translations(chunk_trans: List[str]) -> str:
+        """
+        Merge chunk translations intelligently
+        Cleans up spacing and punctuation
+
+        Args:
+            chunk_trans: List of translated chunks
+
+        Returns:
+            Merged translation
+        """
+        # Filter empty chunks
+        chunks = [t.strip() for t in chunk_trans if t.strip()]
+
+        if not chunks:
+            return "[ERROR: Empty translation]"
+
+        # Join with space
+        merged = " ".join(chunks)
+
+        # Clean space before punctuation: " ." → "."
+        merged = re.sub(r'\s+([.,;!?:])', r'\1', merged)
+
+        # Clean multiple spaces: "  " → " "
+        merged = re.sub(r'\s+', ' ', merged)
+
+        return merged.strip()
