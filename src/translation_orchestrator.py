@@ -5,6 +5,7 @@ Coordinates the entire translation pipeline
 from typing import List
 from .sentence_segmenter import Sentence
 from .llm_client import TranslationLLMManager
+from tqdm import tqdm
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -99,13 +100,24 @@ class TranslationOrchestrator:
         total = len(sentences)
         num_batches = (total + batch_size - 1) // batch_size  # Ceiling division
 
-        for batch_idx in range(num_batches):
+        # Progress bar for batches
+        progress_bar = tqdm(
+            range(num_batches),
+            desc=f"Translating to {language.capitalize()}",
+            unit="batch",
+            ncols=100
+        )
+
+        for batch_idx in progress_bar:
             # Calculate batch boundaries
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, total)
             batch_sentences = sentences[start_idx:end_idx]
 
-            logger.info(f"Batch {batch_idx + 1}/{num_batches}: Translating sentences {start_idx + 1}-{end_idx} to {language}...")
+            # Update progress bar description with current batch info
+            progress_bar.set_postfix({
+                'sentences': f'{start_idx + 1}-{end_idx}/{total}'
+            })
 
             # Extract texts from batch (preserves order)
             batch_texts = [sent.text for sent in batch_sentences]
@@ -118,7 +130,6 @@ class TranslationOrchestrator:
                 for i, translation in enumerate(translations):
                     sentence_idx = start_idx + i  # Global index in sentences list
                     sentences[sentence_idx].add_translation(language, translation)
-                    logger.info(f"  [{sentence_idx + 1}] ✓ {translation[:60]}...")
 
             except Exception as e:
                 logger.error(f"  ✗ Batch translation failed: {e}")
