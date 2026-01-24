@@ -7,11 +7,13 @@ llm:
     type: "ollama"
     model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M"
     base_url: "http://localhost:11434"
+    batch_size: 32  # Batch size for Russian translation (adjust based on model size and VRAM)
 
   # Kazakh translation model (llama.cpp)
   kazakh:
     type: "llama_cpp"
     base_url: "http://localhost:8080"
+    batch_size: 48  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
 
 # Translation prompts (placeholders - replace with your actual prompts)
 prompts:

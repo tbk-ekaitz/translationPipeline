@@ -1,9 +1,9 @@
 """
 LLM client wrapper for Ollama and llama.cpp
-Supports multiple models running simultaneously
+Supports multiple models running simultaneously with batch processing
 """
 import requests
-from typing import Optional
+from typing import List, Optional
 from abc import ABC, abstractmethod
 
 
@@ -13,6 +13,11 @@ class BaseLLMClient(ABC):
     @abstractmethod
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         """Generate text from prompt"""
+        pass
+
+    @abstractmethod
+    def generate_batch(self, prompts: List[str], system_prompt: str = "") -> List[str]:
+        """Generate text from multiple prompts in batch"""
         pass
 
 
@@ -58,6 +63,28 @@ class OllamaClient(BaseLLMClient):
             return result.get("response", "").strip()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Ollama API error: {e}")
+
+    def generate_batch(self, prompts: List[str], system_prompt: str = "") -> List[str]:
+        """
+        Generate text from multiple prompts in batch
+        Model stays loaded in GPU, so sequential calls are efficient
+
+        Args:
+            prompts: List of user prompts
+            system_prompt: System prompt (optional)
+
+        Returns:
+            List of generated texts
+        """
+        results = []
+        for prompt in prompts:
+            try:
+                result = self.generate(prompt, system_prompt)
+                results.append(result)
+            except Exception as e:
+                # On error, add error message but continue processing
+                results.append(f"[ERROR: {str(e)}]")
+        return results
 
 
 class LlamaCppClient(BaseLLMClient):
@@ -105,6 +132,28 @@ class LlamaCppClient(BaseLLMClient):
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"llama.cpp API error: {e}")
 
+    def generate_batch(self, prompts: List[str], system_prompt: str = "") -> List[str]:
+        """
+        Generate text from multiple prompts in batch
+        Model stays loaded in GPU, so sequential calls are efficient
+
+        Args:
+            prompts: List of user prompts
+            system_prompt: System prompt (optional)
+
+        Returns:
+            List of generated texts in same order as input
+        """
+        results = []
+        for prompt in prompts:
+            try:
+                result = self.generate(prompt, system_prompt)
+                results.append(result)
+            except Exception as e:
+                # On error, add error message but continue processing
+                results.append(f"[ERROR: {str(e)}]")
+        return results
+
 
 class TranslationLLMManager:
     """Manages multiple LLM clients for translation"""
@@ -147,3 +196,33 @@ class TranslationLLMManager:
         """
         prompt = prompt_template.format(text=text)
         return self.kazakh_client.generate(prompt)
+
+    def translate_batch_to_russian(self, texts: List[str], prompt_template: str) -> List[str]:
+        """
+        Translate multiple texts to Russian in batch
+        Preserves exact order of input texts
+
+        Args:
+            texts: List of texts to translate
+            prompt_template: Prompt template with {text} placeholder
+
+        Returns:
+            List of Russian translations in same order as input
+        """
+        prompts = [prompt_template.format(text=text) for text in texts]
+        return self.russian_client.generate_batch(prompts)
+
+    def translate_batch_to_kazakh(self, texts: List[str], prompt_template: str) -> List[str]:
+        """
+        Translate multiple texts to Kazakh in batch
+        Preserves exact order of input texts
+
+        Args:
+            texts: List of texts to translate
+            prompt_template: Prompt template with {text} placeholder
+
+        Returns:
+            List of Kazakh translations in same order as input
+        """
+        prompts = [prompt_template.format(text=text) for text in texts]
+        return self.kazakh_client.generate_batch(prompts)

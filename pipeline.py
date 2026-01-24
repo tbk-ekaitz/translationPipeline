@@ -106,7 +106,9 @@ def main():
     orchestrator = TranslationOrchestrator(
         llm_manager,
         russian_prompt=config['prompts']['russian'],
-        kazakh_prompt=config['prompts']['kazakh']
+        kazakh_prompt=config['prompts']['kazakh'],
+        russian_batch_size=russian_config.get('batch_size', 32),
+        kazakh_batch_size=kazakh_config.get('batch_size', 48)
     )
     translated_sentences = orchestrator.translate_sentences(sentences)
 
