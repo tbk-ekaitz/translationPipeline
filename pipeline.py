@@ -24,6 +24,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def ensure_nltk_resources():
+    """Ensure required NLTK resources are downloaded"""
+    import nltk
+
+    resources = ['punkt', 'punkt_tab']
+    for resource in resources:
+        try:
+            nltk.data.find(f'tokenizers/{resource}')
+        except LookupError:
+            logger.info(f"Downloading NLTK resource: {resource}...")
+            nltk.download(resource, quiet=True)
+            logger.info(f"✓ NLTK resource downloaded: {resource}")
+
+
 def load_config(config_path: str = "config.yaml") -> dict:
     """Load configuration from YAML file"""
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -59,6 +73,9 @@ def main():
     # Load configuration
     logger.info(f"Loading configuration from {args.config}")
     config = load_config(args.config)
+
+    # Ensure NLTK resources are available
+    ensure_nltk_resources()
 
     # Initialize components
     logger.info("Initializing pipeline components...")

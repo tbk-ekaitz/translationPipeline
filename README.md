@@ -46,8 +46,12 @@ Pipeline de conversión y traducción de documentos DOCX/PDF a múltiples idioma
 
 ```bash
 pip install -r requirements.txt
-python -c "import nltk; nltk.download('punkt')"
+
+# Descargar recursos NLTK necesarios (una sola vez)
+python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 ```
+
+**Nota:** El pipeline descarga automáticamente estos recursos si faltan, pero es mejor instalarlos explícitamente.
 
 ### 2. Configurar modelo Ruso (T-pro-it-2.0) con Ollama
 
