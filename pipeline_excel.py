@@ -2,12 +2,14 @@
 """
 Excel/CSV Translation Pipeline
 Translates specific columns from xlsx/csv files to Russian and Kazakh
+Supports multi-sheet xlsx files and custom column selection
 """
 import argparse
 import logging
 import yaml
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -61,23 +63,29 @@ def load_config(config_path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def read_excel_or_csv(file_path: str) -> pd.DataFrame:
+def read_excel_or_csv(file_path: str) -> Dict[str, pd.DataFrame]:
     """
-    Read xlsx or csv file into a DataFrame
+    Read xlsx or csv file into DataFrames (one per sheet)
 
     Args:
         file_path: Path to the input file
 
     Returns:
-        DataFrame with the file contents
+        Dict mapping sheet names to DataFrames
     """
     path = Path(file_path)
     ext = path.suffix.lower()
 
     if ext == '.xlsx':
-        return pd.read_excel(file_path)
+        # Read all sheets
+        xlsx = pd.ExcelFile(file_path)
+        sheets = {}
+        for sheet_name in xlsx.sheet_names:
+            sheets[sheet_name] = pd.read_excel(xlsx, sheet_name=sheet_name)
+        return sheets
     elif ext == '.csv':
-        return pd.read_csv(file_path)
+        # CSV has only one "sheet"
+        return {"Sheet1": pd.read_csv(file_path)}
     else:
         raise ValueError(f"Unsupported file format: {ext}. Use .xlsx or .csv")
 
@@ -101,7 +109,23 @@ def find_matching_columns(df: pd.DataFrame) -> Optional[Tuple[str, str]]:
     return None
 
 
-def get_output_column_names(source_tuple: Tuple[str, str]) -> dict:
+def validate_custom_columns(df: pd.DataFrame, custom_columns: List[str]) -> List[str]:
+    """
+    Validate that custom columns exist in the DataFrame
+
+    Args:
+        df: DataFrame to check
+        custom_columns: List of column names to validate
+
+    Returns:
+        List of valid column names that exist in the DataFrame
+    """
+    df_columns = set(df.columns)
+    valid_columns = [col for col in custom_columns if col in df_columns]
+    return valid_columns
+
+
+def get_output_column_names_for_tuple(source_tuple: Tuple[str, str]) -> dict:
     """
     Generate output column names based on the source tuple style
 
@@ -109,7 +133,7 @@ def get_output_column_names(source_tuple: Tuple[str, str]) -> dict:
         source_tuple: The matched source column tuple
 
     Returns:
-        Dict with ru_title, ru_content, kz_title, kz_content keys
+        Dict with column name mappings
     """
     title_col, content_col = source_tuple
 
@@ -117,19 +141,39 @@ def get_output_column_names(source_tuple: Tuple[str, str]) -> dict:
     if title_col == "en-title":
         # Lowercase with hyphen style
         return {
-            "ru_title": "ru-title",
-            "ru_content": "ru-content",
-            "kz_title": "kz-title",
-            "kz_content": "kz-content",
+            "columns": [
+                {"source": title_col, "ru": "ru-title", "kz": "kz-title"},
+                {"source": content_col, "ru": "ru-content", "kz": "kz-content"},
+            ]
         }
     else:
         # Uppercase with underscore style (EN_title)
         return {
-            "ru_title": "RU_title",
-            "ru_content": "RU_content",
-            "kz_title": "KZ_title",
-            "kz_content": "KZ_content",
+            "columns": [
+                {"source": title_col, "ru": "RU_title", "kz": "KZ_title"},
+                {"source": content_col, "ru": "RU_content", "kz": "KZ_content"},
+            ]
         }
+
+
+def get_output_column_names_for_custom(custom_columns: List[str]) -> dict:
+    """
+    Generate output column names for custom columns
+
+    Args:
+        custom_columns: List of custom column names
+
+    Returns:
+        Dict with column name mappings
+    """
+    columns = []
+    for col in custom_columns:
+        columns.append({
+            "source": col,
+            "ru": f"{col}_RU",
+            "kz": f"{col}_KZ",
+        })
+    return {"columns": columns}
 
 
 def extract_cells_from_column(df: pd.DataFrame, column_name: str, max_tokens: int) -> List[CellItem]:
@@ -170,7 +214,8 @@ def translate_cells_batched(
     language: str,
     batch_size: int,
     translate_func,
-    prompt_template: str
+    prompt_template: str,
+    column_name: str = ""
 ):
     """
     Translate cells in batches (modifies cells in-place)
@@ -181,6 +226,7 @@ def translate_cells_batched(
         batch_size: Size of each batch
         translate_func: Translation function to use
         prompt_template: Prompt template for translation
+        column_name: Name of the column being translated (for progress display)
     """
     from tqdm import tqdm
     import re
@@ -188,9 +234,10 @@ def translate_cells_batched(
     total = len(cells)
     num_batches = (total + batch_size - 1) // batch_size
 
+    desc = f"[{column_name}] -> {language.capitalize()}" if column_name else f"Translating to {language.capitalize()}"
     progress_bar = tqdm(
         range(num_batches),
-        desc=f"Translating to {language.capitalize()}",
+        desc=desc,
         unit="batch",
         ncols=100
     )
@@ -275,30 +322,90 @@ def merge_chunk_translations(chunk_trans: List[str]) -> str:
     return merged.strip()
 
 
-def save_to_excel(
-    title_cells: List[CellItem],
-    content_cells: List[CellItem],
-    output_columns: dict,
+def process_sheet(
+    df: pd.DataFrame,
+    sheet_name: str,
+    column_mappings: dict,
+    max_tokens: int,
+    llm_manager: TranslationLLMManager,
+    russian_batch_size: int,
+    kazakh_batch_size: int,
+    russian_prompt: str,
+    kazakh_prompt: str
+) -> pd.DataFrame:
+    """
+    Process a single sheet through the translation pipeline
+
+    Args:
+        df: Source DataFrame
+        sheet_name: Name of the sheet (for logging)
+        column_mappings: Dict with column name mappings
+        max_tokens: Maximum tokens per chunk
+        llm_manager: Translation LLM manager
+        russian_batch_size: Batch size for Russian translation
+        kazakh_batch_size: Batch size for Kazakh translation
+        russian_prompt: Prompt for Russian translation
+        kazakh_prompt: Prompt for Kazakh translation
+
+    Returns:
+        DataFrame with translated columns
+    """
+    result_data = {}
+
+    for col_info in column_mappings["columns"]:
+        source_col = col_info["source"]
+        ru_col = col_info["ru"]
+        kz_col = col_info["kz"]
+
+        logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ===")
+
+        # Extract cells
+        cells = extract_cells_from_column(df, source_col, max_tokens)
+        chunked_count = sum(1 for c in cells if c.chunks)
+        logger.info(f"Extracted {len(cells)} cells ({chunked_count} chunked)")
+
+        # Translate to Russian
+        translate_cells_batched(
+            cells,
+            'russian',
+            russian_batch_size,
+            llm_manager.translate_batch_to_russian,
+            russian_prompt,
+            column_name=source_col
+        )
+
+        # Translate to Kazakh
+        translate_cells_batched(
+            cells,
+            'kazakh',
+            kazakh_batch_size,
+            llm_manager.translate_batch_to_kazakh,
+            kazakh_prompt,
+            column_name=source_col
+        )
+
+        # Store results
+        result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
+        result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+
+    return pd.DataFrame(result_data)
+
+
+def save_multi_sheet_excel(
+    sheets_data: Dict[str, pd.DataFrame],
     output_path: str
 ):
     """
-    Save translations to an Excel file
+    Save multiple sheets to an Excel file
 
     Args:
-        title_cells: Translated title cells
-        content_cells: Translated content cells
-        output_columns: Dict with column name mappings
+        sheets_data: Dict mapping sheet names to DataFrames
         output_path: Path for output file
     """
-    data = {
-        output_columns["ru_title"]: [c.translations.get("russian", "") for c in title_cells],
-        output_columns["ru_content"]: [c.translations.get("russian", "") for c in content_cells],
-        output_columns["kz_title"]: [c.translations.get("kazakh", "") for c in title_cells],
-        output_columns["kz_content"]: [c.translations.get("kazakh", "") for c in content_cells],
-    }
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        for sheet_name, df in sheets_data.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    df = pd.DataFrame(data)
-    df.to_excel(output_path, index=False)
     logger.info(f"Output saved to: {output_path}")
 
 
@@ -320,6 +427,13 @@ def main():
         help='Path to configuration file',
         default='config.yaml'
     )
+    parser.add_argument(
+        '--columns',
+        nargs='+',
+        help='Custom columns to translate (overrides default tuple search). '
+             'Example: --columns "Title" "Description" "Notes"',
+        default=None
+    )
 
     args = parser.parse_args()
 
@@ -330,45 +444,12 @@ def main():
     # Ensure NLTK resources are available
     ensure_nltk_resources()
 
-    # Step 1: Read input file
+    # Step 1: Read input file (all sheets)
     logger.info(f"Reading input file: {args.input_file}")
-    df = read_excel_or_csv(args.input_file)
-    logger.info(f"Loaded {len(df)} rows")
+    sheets = read_excel_or_csv(args.input_file)
+    logger.info(f"Found {len(sheets)} sheet(s): {list(sheets.keys())}")
 
-    # Step 2: Find matching columns
-    matched_tuple = find_matching_columns(df)
-
-    if matched_tuple is None:
-        logger.error("No matching column tuple found!")
-        logger.error(f"Expected one of: {COLUMN_TUPLES}")
-        logger.error(f"Found columns: {list(df.columns)}")
-        print("\n[ERROR] Input file does not contain required column pairs.")
-        print(f"Required: One of {COLUMN_TUPLES}")
-        print(f"Found: {list(df.columns)}")
-        return
-
-    title_col, content_col = matched_tuple
-    logger.info(f"Found matching columns: ({title_col}, {content_col})")
-
-    # Get output column names based on style
-    output_columns = get_output_column_names(matched_tuple)
-
-    # Step 3: Extract cells from columns
-    max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
-
-    logger.info(f"Extracting cells from '{title_col}' column...")
-    title_cells = extract_cells_from_column(df, title_col, max_tokens)
-
-    logger.info(f"Extracting cells from '{content_col}' column...")
-    content_cells = extract_cells_from_column(df, content_col, max_tokens)
-
-    # Count chunked cells
-    title_chunked = sum(1 for c in title_cells if c.chunks)
-    content_chunked = sum(1 for c in content_cells if c.chunks)
-    logger.info(f"Title column: {len(title_cells)} cells ({title_chunked} chunked)")
-    logger.info(f"Content column: {len(content_cells)} cells ({content_chunked} chunked)")
-
-    # Step 4: Initialize LLM clients
+    # Step 2: Initialize LLM clients
     logger.info("Initializing LLM clients...")
 
     russian_config = config['llm']['russian']
@@ -391,50 +472,71 @@ def main():
     kazakh_batch_size = kazakh_config.get('batch_size', 48)
     russian_prompt = config['prompts']['russian']
     kazakh_prompt = config['prompts']['kazakh']
+    max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
 
-    # Step 5: Translate title column
-    logger.info("\n=== Translating TITLE column ===")
+    # Step 3: Process each sheet
+    output_sheets = {}
+    use_custom_columns = args.columns is not None
 
-    logger.info("Phase 1: Title -> Russian")
-    translate_cells_batched(
-        title_cells,
-        'russian',
-        russian_batch_size,
-        llm_manager.translate_batch_to_russian,
-        russian_prompt
-    )
+    for sheet_name, df in sheets.items():
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing sheet: {sheet_name} ({len(df)} rows)")
+        logger.info(f"{'='*60}")
 
-    logger.info("Phase 2: Title -> Kazakh")
-    translate_cells_batched(
-        title_cells,
-        'kazakh',
-        kazakh_batch_size,
-        llm_manager.translate_batch_to_kazakh,
-        kazakh_prompt
-    )
+        # Determine columns to translate
+        if use_custom_columns:
+            # Custom column mode
+            valid_columns = validate_custom_columns(df, args.columns)
+            if not valid_columns:
+                logger.warning(f"[{sheet_name}] No matching columns found. Skipping sheet.")
+                logger.warning(f"  Requested: {args.columns}")
+                logger.warning(f"  Available: {list(df.columns)}")
+                continue
 
-    # Step 6: Translate content column
-    logger.info("\n=== Translating CONTENT column ===")
+            if len(valid_columns) != len(args.columns):
+                missing = set(args.columns) - set(valid_columns)
+                logger.warning(f"[{sheet_name}] Some columns not found: {missing}")
 
-    logger.info("Phase 1: Content -> Russian")
-    translate_cells_batched(
-        content_cells,
-        'russian',
-        russian_batch_size,
-        llm_manager.translate_batch_to_russian,
-        russian_prompt
-    )
+            column_mappings = get_output_column_names_for_custom(valid_columns)
+            logger.info(f"Using custom columns: {valid_columns}")
+        else:
+            # Default tuple mode
+            matched_tuple = find_matching_columns(df)
 
-    logger.info("Phase 2: Content -> Kazakh")
-    translate_cells_batched(
-        content_cells,
-        'kazakh',
-        kazakh_batch_size,
-        llm_manager.translate_batch_to_kazakh,
-        kazakh_prompt
-    )
+            if matched_tuple is None:
+                logger.warning(f"[{sheet_name}] No matching column tuple found. Skipping sheet.")
+                logger.warning(f"  Expected one of: {COLUMN_TUPLES}")
+                logger.warning(f"  Found: {list(df.columns)}")
+                continue
 
-    # Step 7: Save output
+            column_mappings = get_output_column_names_for_tuple(matched_tuple)
+            logger.info(f"Found matching columns: {matched_tuple}")
+
+        # Process the sheet
+        result_df = process_sheet(
+            df,
+            sheet_name,
+            column_mappings,
+            max_tokens,
+            llm_manager,
+            russian_batch_size,
+            kazakh_batch_size,
+            russian_prompt,
+            kazakh_prompt
+        )
+
+        output_sheets[sheet_name] = result_df
+
+    # Step 4: Save output
+    if not output_sheets:
+        logger.error("No sheets were processed! Check that your input file has the required columns.")
+        print("\n[ERROR] No sheets were processed.")
+        if use_custom_columns:
+            print(f"Requested columns: {args.columns}")
+        else:
+            print(f"Required column pairs: {COLUMN_TUPLES}")
+        return
+
     logger.info("\nGenerating output file...")
 
     if args.output:
@@ -447,9 +549,10 @@ def main():
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     output_path = f"{output_dir}/{output_base}.xlsx"
-    save_to_excel(title_cells, content_cells, output_columns, output_path)
+    save_multi_sheet_excel(output_sheets, output_path)
 
-    logger.info("Pipeline completed successfully!")
+    logger.info(f"\nPipeline completed successfully!")
+    logger.info(f"Processed {len(output_sheets)} sheet(s)")
 
 
 if __name__ == "__main__":
