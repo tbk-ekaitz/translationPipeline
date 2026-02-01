@@ -1,6 +1,11 @@
 # Translation Pipeline Configuration
 
-# LLM Configuration
+# Yandex Translate API Configuration (for pipeline_excel.py)
+yandex:
+  api_key: "YOUR_YANDEX_API_KEY"
+  folder_id: "YOUR_FOLDER_ID"
+
+# LLM Configuration (for pipeline.py - local models)
 llm:
   # Russian translation model (Ollama)
   russian:

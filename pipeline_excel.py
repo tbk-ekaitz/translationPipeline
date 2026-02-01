@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Excel/CSV Translation Pipeline
+Excel/CSV Translation Pipeline using Yandex Translate API
 Translates specific columns from xlsx/csv files to Russian and Kazakh
 Supports multi-sheet xlsx files and custom column selection
 """
 import argparse
 import logging
+import time
 import yaml
+import requests
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
-
 from dataclasses import dataclass, field
 
 import pandas as pd
-
-from src.llm_client import OllamaClient, TranslationLLMManager
-from src.sentence_segmenter import SentenceSegmenter
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +27,11 @@ COLUMN_TUPLES = [
     ("en-title", "en-content"),
     ("EN_title", "EN_content"),
 ]
+
+# Yandex API limits
+MAX_CHARS_PER_STRING = 2000      # Max chars per individual text
+MAX_CHARS_PER_REQUEST = 10000   # Max total chars per API request
+MAX_REQUESTS_PER_SECOND = 20    # Rate limit
 
 
 @dataclass
@@ -43,18 +47,79 @@ class CellItem:
         self.translations[lang_code] = translation
 
 
-def ensure_nltk_resources():
-    """Ensure required NLTK resources are downloaded"""
-    import nltk
+class YandexTranslateClient:
+    """Client for Yandex Translate API"""
 
-    resources = ['punkt', 'punkt_tab']
-    for resource in resources:
+    API_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
+
+    def __init__(self, api_key: str, folder_id: str):
+        self.api_key = api_key
+        self.folder_id = folder_id
+        self.last_request_time = 0
+        self.request_interval = 1.0 / MAX_REQUESTS_PER_SECOND  # 50ms between requests
+
+    def _rate_limit(self):
+        """Enforce rate limiting"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.request_interval:
+            time.sleep(self.request_interval - elapsed)
+        self.last_request_time = time.time()
+
+    def translate(self, texts: List[str], target_lang: str, source_lang: str = "en") -> List[str]:
+        """
+        Translate a list of texts to target language
+
+        Args:
+            texts: List of texts to translate
+            target_lang: Target language code (ru, kk)
+            source_lang: Source language code (default: en)
+
+        Returns:
+            List of translated texts
+        """
+        if not texts:
+            return []
+
+        self._rate_limit()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Api-Key {self.api_key}"
+        }
+
+        payload = {
+            "folderId": self.folder_id,
+            "texts": texts,
+            "targetLanguageCode": target_lang,
+            "sourceLanguageCode": source_lang
+        }
+
         try:
-            nltk.data.find(f'tokenizers/{resource}')
-        except LookupError:
-            logger.info(f"Downloading NLTK resource: {resource}...")
-            nltk.download(resource, quiet=True)
-            logger.info(f"NLTK resource downloaded: {resource}")
+            response = requests.post(self.API_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+
+            result = response.json()
+            translations = [t["text"] for t in result.get("translations", [])]
+
+            if len(translations) != len(texts):
+                logger.warning(f"Translation count mismatch: sent {len(texts)}, got {len(translations)}")
+
+            return translations
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Yandex API request failed: {e}")
+            raise
+
+
+class TranslationManager:
+    """Manages translations to multiple languages"""
+
+    def __init__(self, client: YandexTranslateClient):
+        self.client = client
+
+    def translate_batch(self, texts: List[str], target_lang: str) -> List[str]:
+        """Translate a batch of texts"""
+        return self.client.translate(texts, target_lang)
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -77,69 +142,37 @@ def read_excel_or_csv(file_path: str) -> Dict[str, pd.DataFrame]:
     ext = path.suffix.lower()
 
     if ext == '.xlsx':
-        # Read all sheets
         xlsx = pd.ExcelFile(file_path)
         sheets = {}
         for sheet_name in xlsx.sheet_names:
             sheets[sheet_name] = pd.read_excel(xlsx, sheet_name=sheet_name)
         return sheets
     elif ext == '.csv':
-        # CSV has only one "sheet"
         return {"Sheet1": pd.read_csv(file_path)}
     else:
         raise ValueError(f"Unsupported file format: {ext}. Use .xlsx or .csv")
 
 
 def find_matching_columns(df: pd.DataFrame) -> Optional[Tuple[str, str]]:
-    """
-    Find a matching column tuple from the hardcoded list
-
-    Args:
-        df: DataFrame to search in
-
-    Returns:
-        Tuple of (title_col, content_col) if found, None otherwise
-    """
+    """Find a matching column tuple from the hardcoded list"""
     columns = set(df.columns)
-
     for title_col, content_col in COLUMN_TUPLES:
         if title_col in columns and content_col in columns:
             return (title_col, content_col)
-
     return None
 
 
 def validate_custom_columns(df: pd.DataFrame, custom_columns: List[str]) -> List[str]:
-    """
-    Validate that custom columns exist in the DataFrame
-
-    Args:
-        df: DataFrame to check
-        custom_columns: List of column names to validate
-
-    Returns:
-        List of valid column names that exist in the DataFrame
-    """
+    """Validate that custom columns exist in the DataFrame"""
     df_columns = set(df.columns)
-    valid_columns = [col for col in custom_columns if col in df_columns]
-    return valid_columns
+    return [col for col in custom_columns if col in df_columns]
 
 
 def get_output_column_names_for_tuple(source_tuple: Tuple[str, str]) -> dict:
-    """
-    Generate output column names based on the source tuple style
-
-    Args:
-        source_tuple: The matched source column tuple
-
-    Returns:
-        Dict with column name mappings
-    """
+    """Generate output column names based on the source tuple style"""
     title_col, content_col = source_tuple
 
-    # Detect naming style based on the title column
     if title_col == "en-title":
-        # Lowercase with hyphen style
         return {
             "columns": [
                 {"source": title_col, "ru": "ru-title", "kz": "kz-title"},
@@ -147,7 +180,6 @@ def get_output_column_names_for_tuple(source_tuple: Tuple[str, str]) -> dict:
             ]
         }
     else:
-        # Uppercase with underscore style (EN_title)
         return {
             "columns": [
                 {"source": title_col, "ru": "RU_title", "kz": "KZ_title"},
@@ -157,15 +189,7 @@ def get_output_column_names_for_tuple(source_tuple: Tuple[str, str]) -> dict:
 
 
 def get_output_column_names_for_custom(custom_columns: List[str]) -> dict:
-    """
-    Generate output column names for custom columns
-
-    Args:
-        custom_columns: List of custom column names
-
-    Returns:
-        Dict with column name mappings
-    """
+    """Generate output column names for custom columns"""
     columns = []
     for col in custom_columns:
         columns.append({
@@ -176,142 +200,127 @@ def get_output_column_names_for_custom(custom_columns: List[str]) -> dict:
     return {"columns": columns}
 
 
-def extract_cells_from_column(df: pd.DataFrame, column_name: str, max_tokens: int) -> List[CellItem]:
+def split_text_by_chars(text: str, max_chars: int = MAX_CHARS_PER_STRING) -> List[str]:
+    """
+    Split text into chunks that fit within character limit
+
+    Args:
+        text: Text to split
+        max_chars: Maximum characters per chunk
+
+    Returns:
+        List of text chunks
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    # Priority separators for splitting
+    separators = ['. ', ', ', '; ', ' ', '']
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining)
+            break
+
+        # Find best split point
+        chunk = remaining[:max_chars]
+        split_pos = max_chars
+
+        for sep in separators:
+            if sep:
+                pos = chunk.rfind(sep)
+                if pos > max_chars // 2:  # Don't split too early
+                    split_pos = pos + len(sep)
+                    break
+            else:
+                # Force split at max_chars
+                split_pos = max_chars
+
+        chunks.append(remaining[:split_pos].strip())
+        remaining = remaining[split_pos:].strip()
+
+    return [c for c in chunks if c]
+
+
+def extract_cells_from_column(df: pd.DataFrame, column_name: str) -> List[CellItem]:
     """
     Extract cells from a column and prepare them for translation
 
     Args:
         df: Source DataFrame
         column_name: Name of the column to extract
-        max_tokens: Maximum tokens per chunk
 
     Returns:
         List of CellItem objects
     """
-    segmenter = SentenceSegmenter(max_tokens=max_tokens)
     cells = []
 
     for idx, value in enumerate(df[column_name]):
-        # Convert to string and handle NaN/None
         text = str(value) if pd.notna(value) else ""
         text = text.strip()
 
         cell = CellItem(row_idx=idx, text=text)
 
-        # Check if cell needs chunking (same logic as sentence segmenter)
-        if text:
-            tokens = segmenter._estimate_tokens(text)
-            if tokens > max_tokens:
-                cell.chunks = segmenter._split_sentence_smart(text)
+        # Check if cell needs chunking (char limit)
+        if text and len(text) > MAX_CHARS_PER_STRING:
+            cell.chunks = split_text_by_chars(text)
 
         cells.append(cell)
 
     return cells
 
 
-def translate_cells_batched(
-    cells: List[CellItem],
-    language: str,
-    batch_size: int,
-    translate_func,
-    prompt_template: str,
-    column_name: str = ""
-):
+def create_batches(items: List[str], max_chars: int = MAX_CHARS_PER_REQUEST) -> List[List[str]]:
     """
-    Translate cells in batches (modifies cells in-place)
+    Group items into batches that fit within character limit per request
 
     Args:
-        cells: List of CellItem objects
-        language: Target language name ('russian' or 'kazakh')
-        batch_size: Size of each batch
-        translate_func: Translation function to use
-        prompt_template: Prompt template for translation
-        column_name: Name of the column being translated (for progress display)
+        items: List of text items
+        max_chars: Maximum total characters per batch
+
+    Returns:
+        List of batches (each batch is a list of strings)
     """
-    from tqdm import tqdm
-    import re
+    batches = []
+    current_batch = []
+    current_chars = 0
 
-    total = len(cells)
-    num_batches = (total + batch_size - 1) // batch_size
+    for item in items:
+        item_chars = len(item)
 
-    desc = f"[{column_name}] -> {language.capitalize()}" if column_name else f"Translating to {language.capitalize()}"
-    progress_bar = tqdm(
-        range(num_batches),
-        desc=desc,
-        unit="batch",
-        ncols=100
-    )
+        # If single item exceeds limit, it goes alone (already chunked)
+        if item_chars > max_chars:
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_chars = 0
+            batches.append([item])
+            continue
 
-    for batch_idx in progress_bar:
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, total)
-        batch_cells = cells[start_idx:end_idx]
-
-        progress_bar.set_postfix({
-            'cells': f'{start_idx + 1}-{end_idx}/{total}'
-        })
-
-        # Expand chunks for batch
-        batch_items = []
-        chunk_metadata = []
-
-        for local_idx, cell in enumerate(batch_cells):
-            global_idx = start_idx + local_idx
-
-            if not cell.text:
-                # Empty cell, skip translation
-                chunk_metadata.append((global_idx, False, 0, True))  # is_empty=True
-            elif cell.chunks:
-                batch_items.extend(cell.chunks)
-                chunk_metadata.append((global_idx, True, len(cell.chunks), False))
-            else:
-                batch_items.append(cell.text)
-                chunk_metadata.append((global_idx, False, 1, False))
-
-        # Translate batch if there are items
-        if batch_items:
-            try:
-                translations = translate_func(batch_items, prompt_template)
-
-                # Merge chunks and assign back
-                trans_idx = 0
-                for global_idx, is_chunked, num_chunks, is_empty in chunk_metadata:
-                    if is_empty:
-                        cells[global_idx].add_translation(language, "")
-                    elif is_chunked:
-                        chunk_trans = translations[trans_idx:trans_idx + num_chunks]
-                        merged = merge_chunk_translations(chunk_trans)
-                        cells[global_idx].add_translation(language, merged)
-                        trans_idx += num_chunks
-                    else:
-                        cells[global_idx].add_translation(language, translations[trans_idx])
-                        trans_idx += 1
-
-            except Exception as e:
-                logger.error(f"Batch translation failed: {e}")
-                for global_idx, _, _, is_empty in chunk_metadata:
-                    if not is_empty:
-                        cells[global_idx].add_translation(language, f"[ERROR: {str(e)}]")
+        # Check if adding this item exceeds limit
+        if current_chars + item_chars > max_chars:
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [item]
+            current_chars = item_chars
         else:
-            # All cells in batch were empty
-            for global_idx, _, _, _ in chunk_metadata:
-                cells[global_idx].add_translation(language, "")
+            current_batch.append(item)
+            current_chars += item_chars
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 def merge_chunk_translations(chunk_trans: List[str]) -> str:
-    """
-    Merge chunk translations intelligently
-
-    Args:
-        chunk_trans: List of translated chunks
-
-    Returns:
-        Merged translation
-    """
+    """Merge chunk translations intelligently"""
     import re
 
     chunks = [t.strip() for t in chunk_trans if t.strip()]
-
     if not chunks:
         return "[ERROR: Empty translation]"
 
@@ -322,16 +331,95 @@ def merge_chunk_translations(chunk_trans: List[str]) -> str:
     return merged.strip()
 
 
+def translate_cells(
+    cells: List[CellItem],
+    target_lang: str,
+    lang_name: str,
+    manager: TranslationManager,
+    column_name: str = ""
+):
+    """
+    Translate cells using Yandex API with smart batching
+
+    Args:
+        cells: List of CellItem objects
+        target_lang: Target language code (ru, kk)
+        lang_name: Language name for display (russian, kazakh)
+        manager: Translation manager
+        column_name: Column name for progress display
+    """
+    # Build flat list of items to translate with metadata
+    items_to_translate = []
+    metadata = []  # (cell_idx, is_chunked, chunk_count, is_empty)
+
+    for idx, cell in enumerate(cells):
+        if not cell.text:
+            metadata.append((idx, False, 0, True))
+        elif cell.chunks:
+            items_to_translate.extend(cell.chunks)
+            metadata.append((idx, True, len(cell.chunks), False))
+        else:
+            items_to_translate.append(cell.text)
+            metadata.append((idx, False, 1, False))
+
+    if not items_to_translate:
+        # All cells are empty
+        for idx, _, _, _ in metadata:
+            cells[idx].add_translation(lang_name, "")
+        return
+
+    # Create batches
+    batches = create_batches(items_to_translate)
+
+    desc = f"[{column_name}] -> {lang_name.capitalize()}" if column_name else f"-> {lang_name.capitalize()}"
+
+    # Translate batches
+    all_translations = []
+    total_chars = sum(len(item) for item in items_to_translate)
+
+    progress_bar = tqdm(
+        batches,
+        desc=desc,
+        unit="batch",
+        ncols=100
+    )
+
+    for batch in progress_bar:
+        batch_chars = sum(len(t) for t in batch)
+        progress_bar.set_postfix({
+            'items': len(batch),
+            'chars': f'{batch_chars}'
+        })
+
+        try:
+            translations = manager.translate_batch(batch, target_lang)
+            all_translations.extend(translations)
+        except Exception as e:
+            logger.error(f"Batch translation failed: {e}")
+            all_translations.extend([f"[ERROR: {str(e)}]"] * len(batch))
+
+    # Assign translations back to cells
+    trans_idx = 0
+    for cell_idx, is_chunked, chunk_count, is_empty in metadata:
+        if is_empty:
+            cells[cell_idx].add_translation(lang_name, "")
+        elif is_chunked:
+            chunk_trans = all_translations[trans_idx:trans_idx + chunk_count]
+            merged = merge_chunk_translations(chunk_trans)
+            cells[cell_idx].add_translation(lang_name, merged)
+            trans_idx += chunk_count
+        else:
+            cells[cell_idx].add_translation(lang_name, all_translations[trans_idx])
+            trans_idx += 1
+
+    logger.info(f"Translated {len(items_to_translate)} items ({total_chars} chars) in {len(batches)} batches")
+
+
 def process_sheet(
     df: pd.DataFrame,
     sheet_name: str,
     column_mappings: dict,
-    max_tokens: int,
-    llm_manager: TranslationLLMManager,
-    russian_batch_size: int,
-    kazakh_batch_size: int,
-    russian_prompt: str,
-    kazakh_prompt: str
+    manager: TranslationManager
 ) -> pd.DataFrame:
     """
     Process a single sheet through the translation pipeline
@@ -340,12 +428,7 @@ def process_sheet(
         df: Source DataFrame
         sheet_name: Name of the sheet (for logging)
         column_mappings: Dict with column name mappings
-        max_tokens: Maximum tokens per chunk
-        llm_manager: Translation LLM manager
-        russian_batch_size: Batch size for Russian translation
-        kazakh_batch_size: Batch size for Kazakh translation
-        russian_prompt: Prompt for Russian translation
-        kazakh_prompt: Prompt for Kazakh translation
+        manager: Translation manager
 
     Returns:
         DataFrame with translated columns
@@ -360,29 +443,19 @@ def process_sheet(
         logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ===")
 
         # Extract cells
-        cells = extract_cells_from_column(df, source_col, max_tokens)
+        cells = extract_cells_from_column(df, source_col)
+        non_empty = sum(1 for c in cells if c.text)
         chunked_count = sum(1 for c in cells if c.chunks)
-        logger.info(f"Extracted {len(cells)} cells ({chunked_count} chunked)")
+        total_chars = sum(len(c.text) for c in cells)
+
+        logger.info(f"Extracted {len(cells)} cells ({non_empty} non-empty, {chunked_count} chunked)")
+        logger.info(f"Total characters: {total_chars:,}")
 
         # Translate to Russian
-        translate_cells_batched(
-            cells,
-            'russian',
-            russian_batch_size,
-            llm_manager.translate_batch_to_russian,
-            russian_prompt,
-            column_name=source_col
-        )
+        translate_cells(cells, "ru", "russian", manager, column_name=source_col)
 
         # Translate to Kazakh
-        translate_cells_batched(
-            cells,
-            'kazakh',
-            kazakh_batch_size,
-            llm_manager.translate_batch_to_kazakh,
-            kazakh_prompt,
-            column_name=source_col
-        )
+        translate_cells(cells, "kk", "kazakh", manager, column_name=source_col)
 
         # Store results
         result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
@@ -391,27 +464,17 @@ def process_sheet(
     return pd.DataFrame(result_data)
 
 
-def save_multi_sheet_excel(
-    sheets_data: Dict[str, pd.DataFrame],
-    output_path: str
-):
-    """
-    Save multiple sheets to an Excel file
-
-    Args:
-        sheets_data: Dict mapping sheet names to DataFrames
-        output_path: Path for output file
-    """
+def save_multi_sheet_excel(sheets_data: Dict[str, pd.DataFrame], output_path: str):
+    """Save multiple sheets to an Excel file"""
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for sheet_name, df in sheets_data.items():
             df.to_excel(writer, sheet_name=sheet_name, index=False)
-
     logger.info(f"Output saved to: {output_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Excel/CSV Translation Pipeline: XLSX/CSV -> Translations -> XLSX'
+        description='Excel/CSV Translation Pipeline (Yandex Translate API)'
     )
     parser.add_argument(
         'input_file',
@@ -441,40 +504,27 @@ def main():
     logger.info(f"Loading configuration from {args.config}")
     config = load_config(args.config)
 
-    # Ensure NLTK resources are available
-    ensure_nltk_resources()
+    # Initialize Yandex client
+    yandex_config = config.get('yandex', {})
+    api_key = yandex_config.get('api_key')
+    folder_id = yandex_config.get('folder_id')
 
-    # Step 1: Read input file (all sheets)
+    if not api_key or not folder_id:
+        logger.error("Yandex API credentials not found in config!")
+        logger.error("Please add 'yandex.api_key' and 'yandex.folder_id' to config.yaml")
+        return
+
+    logger.info("Initializing Yandex Translate API client...")
+    client = YandexTranslateClient(api_key, folder_id)
+    manager = TranslationManager(client)
+    logger.info("Yandex client ready")
+
+    # Read input file
     logger.info(f"Reading input file: {args.input_file}")
     sheets = read_excel_or_csv(args.input_file)
     logger.info(f"Found {len(sheets)} sheet(s): {list(sheets.keys())}")
 
-    # Step 2: Initialize LLM clients
-    logger.info("Initializing LLM clients...")
-
-    russian_config = config['llm']['russian']
-    russian_client = OllamaClient(
-        model_name=russian_config['model_name'],
-        base_url=russian_config['base_url']
-    )
-    logger.info(f"Russian model ready: {russian_config['model_name']}")
-
-    kazakh_config = config['llm']['kazakh']
-    kazakh_client = OllamaClient(
-        model_name=kazakh_config['model_name'],
-        base_url=kazakh_config['base_url']
-    )
-    logger.info(f"Kazakh model ready: {kazakh_config['model_name']}")
-
-    llm_manager = TranslationLLMManager(russian_client, kazakh_client)
-
-    russian_batch_size = russian_config.get('batch_size', 32)
-    kazakh_batch_size = kazakh_config.get('batch_size', 48)
-    russian_prompt = config['prompts']['russian']
-    kazakh_prompt = config['prompts']['kazakh']
-    max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
-
-    # Step 3: Process each sheet
+    # Process each sheet
     output_sheets = {}
     use_custom_columns = args.columns is not None
 
@@ -485,27 +535,23 @@ def main():
 
         # Determine columns to translate
         if use_custom_columns:
-            # Custom column mode
             valid_columns = validate_custom_columns(df, args.columns)
             if not valid_columns:
-                logger.warning(f"[{sheet_name}] No matching columns found. Skipping sheet.")
-                logger.warning(f"  Requested: {args.columns}")
-                logger.warning(f"  Available: {list(df.columns)}")
+                logger.warning(f"[{sheet_name}] No matching columns found. Skipping.")
                 continue
 
             if len(valid_columns) != len(args.columns):
                 missing = set(args.columns) - set(valid_columns)
-                logger.warning(f"[{sheet_name}] Some columns not found: {missing}")
+                logger.warning(f"[{sheet_name}] Columns not found: {missing}")
 
             column_mappings = get_output_column_names_for_custom(valid_columns)
             logger.info(f"Using custom columns: {valid_columns}")
         else:
-            # Default tuple mode
             matched_tuple = find_matching_columns(df)
 
             if matched_tuple is None:
-                logger.warning(f"[{sheet_name}] No matching column tuple found. Skipping sheet.")
-                logger.warning(f"  Expected one of: {COLUMN_TUPLES}")
+                logger.warning(f"[{sheet_name}] No matching column tuple found. Skipping.")
+                logger.warning(f"  Expected: {COLUMN_TUPLES}")
                 logger.warning(f"  Found: {list(df.columns)}")
                 continue
 
@@ -513,23 +559,12 @@ def main():
             logger.info(f"Found matching columns: {matched_tuple}")
 
         # Process the sheet
-        result_df = process_sheet(
-            df,
-            sheet_name,
-            column_mappings,
-            max_tokens,
-            llm_manager,
-            russian_batch_size,
-            kazakh_batch_size,
-            russian_prompt,
-            kazakh_prompt
-        )
-
+        result_df = process_sheet(df, sheet_name, column_mappings, manager)
         output_sheets[sheet_name] = result_df
 
-    # Step 4: Save output
+    # Save output
     if not output_sheets:
-        logger.error("No sheets were processed! Check that your input file has the required columns.")
+        logger.error("No sheets were processed!")
         print("\n[ERROR] No sheets were processed.")
         if use_custom_columns:
             print(f"Requested columns: {args.columns}")
@@ -545,7 +580,7 @@ def main():
         input_path = Path(args.input_file)
         output_base = input_path.stem + "_translated"
 
-    output_dir = config['output']['directory']
+    output_dir = config.get('output', {}).get('directory', './output')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     output_path = f"{output_dir}/{output_base}.xlsx"
