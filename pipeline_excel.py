@@ -2,16 +2,18 @@
 """
 Excel/CSV Translation Pipeline using Yandex Translate API
 Translates specific columns from xlsx/csv files to Russian and Kazakh
-Supports multi-sheet xlsx files and custom column selection
+Supports multi-sheet xlsx files, custom column selection, and partial progress resume
 """
 import argparse
+import hashlib
+import json
 import logging
 import time
 import yaml
 import requests
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass, field, asdict
 
 import pandas as pd
 from tqdm import tqdm
@@ -28,9 +30,12 @@ COLUMN_TUPLES = [
     ("EN_title", "EN_content"),
 ]
 
-# Yandex API limits (official)
+# Yandex API limits (using 90% of official to avoid constant 429s)
+# Official: 2000 chars/string, 10K chars/request, 20 req/s
 MAX_CHARS_PER_STRING = 2000       # Max chars per individual text
-MAX_CHARS_PER_REQUEST = 10000     # Max total chars per API request
+MAX_CHARS_PER_REQUEST = 9000      # 90% of 10K
+MAX_REQUESTS_PER_SECOND = 18      # 90% of 20
+REQUEST_INTERVAL = 1.0 / MAX_REQUESTS_PER_SECOND  # ~55ms between requests
 
 # Retry configuration
 MAX_RETRIES = 5
@@ -50,51 +55,104 @@ class CellItem:
         self.translations[lang_code] = translation
 
 
+class PartialProgress:
+    """Manages partial progress saving and loading"""
+
+    def __init__(self, output_dir: str, input_file: str):
+        self.output_dir = Path(output_dir)
+        self.input_hash = self._compute_file_hash(input_file)
+        self.input_name = Path(input_file).stem
+        self.partial_file = self.output_dir / f".{self.input_name}.partial.json"
+
+    def _compute_file_hash(self, file_path: str) -> str:
+        """Compute MD5 hash of input file for identification"""
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def exists(self) -> bool:
+        """Check if partial progress file exists and matches input"""
+        if not self.partial_file.exists():
+            return False
+
+        try:
+            with open(self.partial_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('input_hash') == self.input_hash
+        except (json.JSONDecodeError, KeyError):
+            return False
+
+    def load(self) -> Optional[Dict[str, Any]]:
+        """Load partial progress if it exists and matches"""
+        if not self.exists():
+            return None
+
+        try:
+            with open(self.partial_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print(f"\n[RESUME] Found partial progress file: {self.partial_file}")
+            print(f"[RESUME] Resuming from previous session...")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load partial progress: {e}")
+            return None
+
+    def save(self, progress_data: Dict[str, Any]):
+        """Save current progress"""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        progress_data['input_hash'] = self.input_hash
+        progress_data['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        with open(self.partial_file, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, ensure_ascii=False, indent=2)
+
+        print(f"\n[PARTIAL SAVE] Progress saved to: {self.partial_file}")
+        print(f"[PARTIAL SAVE] Run again to resume from this point")
+
+    def delete(self):
+        """Delete partial progress file after successful completion"""
+        if self.partial_file.exists():
+            self.partial_file.unlink()
+            logger.info(f"Cleaned up partial progress file")
+
+
 class YandexTranslateClient:
-    """Client for Yandex Translate API with automatic retry on rate limits"""
+    """Client for Yandex Translate API with rate limiting and automatic retry"""
 
     API_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
 
     def __init__(self, api_key: str, folder_id: str):
         self.api_key = api_key
         self.folder_id = folder_id
+        self.last_request_time = 0
+        self.total_429_hits = 0
+
+    def _rate_limit(self):
+        """Enforce rate limiting at 90% of official limit"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < REQUEST_INTERVAL:
+            time.sleep(REQUEST_INTERVAL - elapsed)
+        self.last_request_time = time.time()
 
     def _wait_and_retry(self, response: requests.Response, attempt: int) -> float:
-        """
-        Calculate wait time when rate limited
-
-        Args:
-            response: The 429 response from Yandex
-            attempt: Current retry attempt number
-
-        Returns:
-            Seconds to wait before retry
-        """
-        # Try to get Retry-After header from Yandex
+        """Calculate wait time when rate limited"""
         retry_after = response.headers.get('Retry-After')
         if retry_after:
             try:
                 return float(retry_after)
             except ValueError:
                 pass
-
-        # Fallback: exponential backoff
         return BASE_RETRY_DELAY * (2 ** attempt)
 
     def translate(self, texts: List[str], target_lang: str, source_lang: str = "en") -> List[str]:
-        """
-        Translate a list of texts to target language with automatic retry
-
-        Args:
-            texts: List of texts to translate
-            target_lang: Target language code (ru, kk)
-            source_lang: Source language code (default: en)
-
-        Returns:
-            List of translated texts
-        """
+        """Translate a list of texts to target language with automatic retry"""
         if not texts:
             return []
+
+        self._rate_limit()
 
         headers = {
             "Content-Type": "application/json",
@@ -116,12 +174,12 @@ class YandexTranslateClient:
 
                 # Handle rate limiting (429)
                 if response.status_code == 429:
+                    self.total_429_hits += 1
                     wait_time = self._wait_and_retry(response, attempt)
-                    logger.warning(f"Rate limited by Yandex. Waiting {wait_time:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    print(f"\n[429 RATE LIMITED] Yandex says slow down! Waiting {wait_time:.1f}s... (attempt {attempt + 1}/{MAX_RETRIES}, total 429s: {self.total_429_hits})")
                     time.sleep(wait_time)
                     continue
 
-                # Handle other errors
                 response.raise_for_status()
 
                 result = response.json()
@@ -140,7 +198,6 @@ class YandexTranslateClient:
                     time.sleep(wait_time)
                 continue
 
-        # All retries exhausted
         logger.error(f"Yandex API request failed after {MAX_RETRIES} attempts")
         if last_exception:
             raise last_exception
@@ -165,15 +222,7 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 
 def read_excel_or_csv(file_path: str) -> Dict[str, pd.DataFrame]:
-    """
-    Read xlsx or csv file into DataFrames (one per sheet)
-
-    Args:
-        file_path: Path to the input file
-
-    Returns:
-        Dict mapping sheet names to DataFrames
-    """
+    """Read xlsx or csv file into DataFrames (one per sheet)"""
     path = Path(file_path)
     ext = path.suffix.lower()
 
@@ -237,23 +286,12 @@ def get_output_column_names_for_custom(custom_columns: List[str]) -> dict:
 
 
 def split_text_by_chars(text: str, max_chars: int = MAX_CHARS_PER_STRING) -> List[str]:
-    """
-    Split text into chunks that fit within character limit
-
-    Args:
-        text: Text to split
-        max_chars: Maximum characters per chunk
-
-    Returns:
-        List of text chunks
-    """
+    """Split text into chunks that fit within character limit"""
     if len(text) <= max_chars:
         return [text]
 
     chunks = []
     remaining = text
-
-    # Priority separators for splitting
     separators = ['. ', ', ', '; ', ' ', '']
 
     while remaining:
@@ -261,18 +299,16 @@ def split_text_by_chars(text: str, max_chars: int = MAX_CHARS_PER_STRING) -> Lis
             chunks.append(remaining)
             break
 
-        # Find best split point
         chunk = remaining[:max_chars]
         split_pos = max_chars
 
         for sep in separators:
             if sep:
                 pos = chunk.rfind(sep)
-                if pos > max_chars // 2:  # Don't split too early
+                if pos > max_chars // 2:
                     split_pos = pos + len(sep)
                     break
             else:
-                # Force split at max_chars
                 split_pos = max_chars
 
         chunks.append(remaining[:split_pos].strip())
@@ -282,16 +318,7 @@ def split_text_by_chars(text: str, max_chars: int = MAX_CHARS_PER_STRING) -> Lis
 
 
 def extract_cells_from_column(df: pd.DataFrame, column_name: str) -> List[CellItem]:
-    """
-    Extract cells from a column and prepare them for translation
-
-    Args:
-        df: Source DataFrame
-        column_name: Name of the column to extract
-
-    Returns:
-        List of CellItem objects
-    """
+    """Extract cells from a column and prepare them for translation"""
     cells = []
 
     for idx, value in enumerate(df[column_name]):
@@ -300,7 +327,6 @@ def extract_cells_from_column(df: pd.DataFrame, column_name: str) -> List[CellIt
 
         cell = CellItem(row_idx=idx, text=text)
 
-        # Check if cell needs chunking (char limit)
         if text and len(text) > MAX_CHARS_PER_STRING:
             cell.chunks = split_text_by_chars(text)
 
@@ -310,16 +336,7 @@ def extract_cells_from_column(df: pd.DataFrame, column_name: str) -> List[CellIt
 
 
 def create_batches(items: List[str], max_chars: int = MAX_CHARS_PER_REQUEST) -> List[List[str]]:
-    """
-    Group items into batches that fit within character limit per request
-
-    Args:
-        items: List of text items
-        max_chars: Maximum total characters per batch
-
-    Returns:
-        List of batches (each batch is a list of strings)
-    """
+    """Group items into batches that fit within character limit per request"""
     batches = []
     current_batch = []
     current_chars = 0
@@ -327,7 +344,6 @@ def create_batches(items: List[str], max_chars: int = MAX_CHARS_PER_REQUEST) -> 
     for item in items:
         item_chars = len(item)
 
-        # If single item exceeds limit, it goes alone (already chunked)
         if item_chars > max_chars:
             if current_batch:
                 batches.append(current_batch)
@@ -336,7 +352,6 @@ def create_batches(items: List[str], max_chars: int = MAX_CHARS_PER_REQUEST) -> 
             batches.append([item])
             continue
 
-        # Check if adding this item exceeds limit
         if current_chars + item_chars > max_chars:
             if current_batch:
                 batches.append(current_batch)
@@ -372,21 +387,18 @@ def translate_cells(
     target_lang: str,
     lang_name: str,
     manager: TranslationManager,
-    column_name: str = ""
-):
+    column_name: str = "",
+    partial_progress: Optional[PartialProgress] = None,
+    progress_data: Optional[Dict] = None
+) -> bool:
     """
     Translate cells using Yandex API with smart batching
 
-    Args:
-        cells: List of CellItem objects
-        target_lang: Target language code (ru, kk)
-        lang_name: Language name for display (russian, kazakh)
-        manager: Translation manager
-        column_name: Column name for progress display
+    Returns:
+        True if completed successfully, False if failed (partial saved)
     """
-    # Build flat list of items to translate with metadata
     items_to_translate = []
-    metadata = []  # (cell_idx, is_chunked, chunk_count, is_empty)
+    metadata = []
 
     for idx, cell in enumerate(cells):
         if not cell.text:
@@ -399,17 +411,14 @@ def translate_cells(
             metadata.append((idx, False, 1, False))
 
     if not items_to_translate:
-        # All cells are empty
         for idx, _, _, _ in metadata:
             cells[idx].add_translation(lang_name, "")
-        return
+        return True
 
-    # Create batches
     batches = create_batches(items_to_translate)
 
     desc = f"[{column_name}] -> {lang_name.capitalize()}" if column_name else f"-> {lang_name.capitalize()}"
 
-    # Translate batches
     all_translations = []
     total_chars = sum(len(item) for item in items_to_translate)
 
@@ -420,21 +429,44 @@ def translate_cells(
         ncols=100
     )
 
-    for batch in progress_bar:
-        batch_chars = sum(len(t) for t in batch)
-        progress_bar.set_postfix({
-            'items': len(batch),
-            'chars': f'{batch_chars}'
-        })
+    try:
+        for batch_idx, batch in enumerate(progress_bar):
+            batch_chars = sum(len(t) for t in batch)
+            progress_bar.set_postfix({
+                'items': len(batch),
+                'chars': f'{batch_chars}'
+            })
 
-        try:
             translations = manager.translate_batch(batch, target_lang)
             all_translations.extend(translations)
-        except Exception as e:
-            logger.error(f"Batch translation failed: {e}")
-            all_translations.extend([f"[ERROR: {str(e)}]"] * len(batch))
 
-    # Assign translations back to cells
+    except Exception as e:
+        logger.error(f"Translation failed: {e}")
+
+        # Save partial progress
+        if partial_progress and progress_data is not None:
+            # Save what we have so far
+            trans_idx = 0
+            for cell_idx, is_chunked, chunk_count, is_empty in metadata:
+                if trans_idx >= len(all_translations):
+                    break
+                if is_empty:
+                    cells[cell_idx].add_translation(lang_name, "")
+                elif is_chunked and trans_idx + chunk_count <= len(all_translations):
+                    chunk_trans = all_translations[trans_idx:trans_idx + chunk_count]
+                    merged = merge_chunk_translations(chunk_trans)
+                    cells[cell_idx].add_translation(lang_name, merged)
+                    trans_idx += chunk_count
+                elif not is_chunked:
+                    cells[cell_idx].add_translation(lang_name, all_translations[trans_idx])
+                    trans_idx += 1
+
+            print(f"\n[FAILED] Translation failed after {len(all_translations)} items")
+            partial_progress.save(progress_data)
+
+        return False
+
+    # Assign all translations
     trans_idx = 0
     for cell_idx, is_chunked, chunk_count, is_empty in metadata:
         if is_empty:
@@ -449,36 +481,38 @@ def translate_cells(
             trans_idx += 1
 
     logger.info(f"Translated {len(items_to_translate)} items ({total_chars} chars) in {len(batches)} batches")
+    return True
 
 
 def process_sheet(
     df: pd.DataFrame,
     sheet_name: str,
     column_mappings: dict,
-    manager: TranslationManager
-) -> pd.DataFrame:
+    manager: TranslationManager,
+    partial_progress: Optional[PartialProgress] = None,
+    existing_results: Optional[Dict] = None
+) -> Tuple[Optional[pd.DataFrame], Dict]:
     """
     Process a single sheet through the translation pipeline
 
-    Args:
-        df: Source DataFrame
-        sheet_name: Name of the sheet (for logging)
-        column_mappings: Dict with column name mappings
-        manager: Translation manager
-
     Returns:
-        DataFrame with translated columns
+        Tuple of (result DataFrame or None if failed, progress data dict)
     """
-    result_data = {}
+    result_data = existing_results.copy() if existing_results else {}
+    progress_data = {'sheets': {}, 'completed_columns': {}}
 
     for col_info in column_mappings["columns"]:
         source_col = col_info["source"]
         ru_col = col_info["ru"]
         kz_col = col_info["kz"]
 
+        # Check if already completed in partial
+        if ru_col in result_data and kz_col in result_data:
+            logger.info(f"[{sheet_name}] Column {source_col} already translated, skipping...")
+            continue
+
         logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ===")
 
-        # Extract cells
         cells = extract_cells_from_column(df, source_col)
         non_empty = sum(1 for c in cells if c.text)
         chunked_count = sum(1 for c in cells if c.chunks)
@@ -487,17 +521,40 @@ def process_sheet(
         logger.info(f"Extracted {len(cells)} cells ({non_empty} non-empty, {chunked_count} chunked)")
         logger.info(f"Total characters: {total_chars:,}")
 
-        # Translate to Russian
-        translate_cells(cells, "ru", "russian", manager, column_name=source_col)
+        # Update progress data
+        progress_data['sheets'][sheet_name] = result_data
 
-        # Translate to Kazakh
-        translate_cells(cells, "kk", "kazakh", manager, column_name=source_col)
+        # Translate to Russian (if not already done)
+        if ru_col not in result_data:
+            success = translate_cells(
+                cells, "ru", "russian", manager,
+                column_name=source_col,
+                partial_progress=partial_progress,
+                progress_data=progress_data
+            )
+            if not success:
+                result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
+                progress_data['sheets'][sheet_name] = result_data
+                return None, progress_data
 
-        # Store results
-        result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
-        result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+            result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
 
-    return pd.DataFrame(result_data)
+        # Translate to Kazakh (if not already done)
+        if kz_col not in result_data:
+            success = translate_cells(
+                cells, "kk", "kazakh", manager,
+                column_name=source_col,
+                partial_progress=partial_progress,
+                progress_data=progress_data
+            )
+            if not success:
+                result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+                progress_data['sheets'][sheet_name] = result_data
+                return None, progress_data
+
+            result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+
+    return pd.DataFrame(result_data), progress_data
 
 
 def save_multi_sheet_excel(sheets_data: Dict[str, pd.DataFrame], output_path: str):
@@ -533,12 +590,33 @@ def main():
              'Example: --columns "Title" "Description" "Notes"',
         default=None
     )
+    parser.add_argument(
+        '--renew',
+        action='store_true',
+        help='Ignore partial progress and start fresh'
+    )
 
     args = parser.parse_args()
 
     # Load configuration
     logger.info(f"Loading configuration from {args.config}")
     config = load_config(args.config)
+
+    output_dir = config.get('output', {}).get('directory', './output')
+
+    # Initialize partial progress tracker
+    partial_progress = PartialProgress(output_dir, args.input_file)
+
+    # Check for existing partial progress
+    existing_progress = None
+    if not args.renew:
+        existing_progress = partial_progress.load()
+        if existing_progress:
+            logger.info("Continuing from partial progress...")
+    else:
+        if partial_progress.exists():
+            print("[RENEW] Ignoring existing partial progress, starting fresh...")
+            partial_progress.delete()
 
     # Initialize Yandex client
     yandex_config = config.get('yandex', {})
@@ -551,6 +629,7 @@ def main():
         return
 
     logger.info("Initializing Yandex Translate API client...")
+    logger.info(f"Rate limiting at 90%: {MAX_REQUESTS_PER_SECOND} req/s, {MAX_CHARS_PER_REQUEST} chars/request")
     client = YandexTranslateClient(api_key, folder_id)
     manager = TranslationManager(client)
     logger.info("Yandex client ready")
@@ -563,11 +642,19 @@ def main():
     # Process each sheet
     output_sheets = {}
     use_custom_columns = args.columns is not None
+    all_success = True
 
     for sheet_name, df in sheets.items():
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing sheet: {sheet_name} ({len(df)} rows)")
         logger.info(f"{'='*60}")
+
+        # Get existing results for this sheet if resuming
+        existing_results = None
+        if existing_progress and 'sheets' in existing_progress:
+            existing_results = existing_progress['sheets'].get(sheet_name)
+            if existing_results:
+                logger.info(f"Found {len(existing_results)} existing columns from partial progress")
 
         # Determine columns to translate
         if use_custom_columns:
@@ -595,7 +682,16 @@ def main():
             logger.info(f"Found matching columns: {matched_tuple}")
 
         # Process the sheet
-        result_df = process_sheet(df, sheet_name, column_mappings, manager)
+        result_df, progress_data = process_sheet(
+            df, sheet_name, column_mappings, manager,
+            partial_progress=partial_progress,
+            existing_results=existing_results
+        )
+
+        if result_df is None:
+            all_success = False
+            break
+
         output_sheets[sheet_name] = result_df
 
     # Save output
@@ -608,22 +704,31 @@ def main():
             print(f"Required column pairs: {COLUMN_TUPLES}")
         return
 
-    logger.info("\nGenerating output file...")
+    if all_success:
+        logger.info("\nGenerating output file...")
 
-    if args.output:
-        output_base = args.output
+        if args.output:
+            output_base = args.output
+        else:
+            input_path = Path(args.input_file)
+            output_base = input_path.stem + "_translated"
+
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        output_path = f"{output_dir}/{output_base}.xlsx"
+        save_multi_sheet_excel(output_sheets, output_path)
+
+        # Clean up partial progress on success
+        partial_progress.delete()
+
+        print(f"\n[SUCCESS] Pipeline completed!")
+        print(f"[SUCCESS] Output: {output_path}")
+        print(f"[SUCCESS] Processed {len(output_sheets)} sheet(s)")
+        if client.total_429_hits > 0:
+            print(f"[INFO] Total 429 rate limits hit: {client.total_429_hits}")
     else:
-        input_path = Path(args.input_file)
-        output_base = input_path.stem + "_translated"
-
-    output_dir = config.get('output', {}).get('directory', './output')
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    output_path = f"{output_dir}/{output_base}.xlsx"
-    save_multi_sheet_excel(output_sheets, output_path)
-
-    logger.info(f"\nPipeline completed successfully!")
-    logger.info(f"Processed {len(output_sheets)} sheet(s)")
+        print(f"\n[INCOMPLETE] Pipeline stopped due to errors")
+        print(f"[INCOMPLETE] Run again to resume from partial progress")
 
 
 if __name__ == "__main__":
