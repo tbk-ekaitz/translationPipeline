@@ -28,10 +28,12 @@ COLUMN_TUPLES = [
     ("EN_title", "EN_content"),
 ]
 
-# Yandex API limits
-MAX_CHARS_PER_STRING = 2000      # Max chars per individual text
-MAX_CHARS_PER_REQUEST = 10000   # Max total chars per API request
-MAX_REQUESTS_PER_SECOND = 20    # Rate limit
+# Yandex API limits (conservative: 50% of official limits)
+# Official: 2000 chars/string, 10K chars/request, 20 req/s, 1M chars/hour
+MAX_CHARS_PER_STRING = 2000       # Max chars per individual text (no change needed)
+MAX_CHARS_PER_REQUEST = 5000      # Conservative: 50% of 10K
+MAX_REQUESTS_PER_SECOND = 10      # Conservative: 50% of 20
+MAX_CHARS_PER_HOUR = 500_000      # Conservative: 50% of 1M
 
 
 @dataclass
@@ -48,7 +50,7 @@ class CellItem:
 
 
 class YandexTranslateClient:
-    """Client for Yandex Translate API"""
+    """Client for Yandex Translate API with conservative rate limiting"""
 
     API_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
 
@@ -56,14 +58,38 @@ class YandexTranslateClient:
         self.api_key = api_key
         self.folder_id = folder_id
         self.last_request_time = 0
-        self.request_interval = 1.0 / MAX_REQUESTS_PER_SECOND  # 50ms between requests
+        self.request_interval = 1.0 / MAX_REQUESTS_PER_SECOND  # 100ms between requests
+        # Hourly char tracking
+        self.hour_start_time = time.time()
+        self.chars_this_hour = 0
 
     def _rate_limit(self):
-        """Enforce rate limiting"""
+        """Enforce rate limiting (requests/second)"""
         elapsed = time.time() - self.last_request_time
         if elapsed < self.request_interval:
             time.sleep(self.request_interval - elapsed)
         self.last_request_time = time.time()
+
+    def _check_hourly_limit(self, chars_to_send: int):
+        """Check and enforce hourly character limit"""
+        current_time = time.time()
+
+        # Reset counter if hour has passed
+        if current_time - self.hour_start_time >= 3600:
+            self.hour_start_time = current_time
+            self.chars_this_hour = 0
+            logger.info("Hourly character counter reset")
+
+        # Check if we'd exceed the limit
+        if self.chars_this_hour + chars_to_send > MAX_CHARS_PER_HOUR:
+            wait_time = 3600 - (current_time - self.hour_start_time)
+            logger.warning(f"Approaching hourly char limit ({self.chars_this_hour:,}/{MAX_CHARS_PER_HOUR:,})")
+            logger.warning(f"Waiting {wait_time:.0f}s for limit reset...")
+            time.sleep(wait_time + 1)
+            self.hour_start_time = time.time()
+            self.chars_this_hour = 0
+
+        self.chars_this_hour += chars_to_send
 
     def translate(self, texts: List[str], target_lang: str, source_lang: str = "en") -> List[str]:
         """
@@ -79,6 +105,10 @@ class YandexTranslateClient:
         """
         if not texts:
             return []
+
+        # Check hourly limit before sending
+        total_chars = sum(len(t) for t in texts)
+        self._check_hourly_limit(total_chars)
 
         self._rate_limit()
 
