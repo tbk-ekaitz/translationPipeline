@@ -28,12 +28,13 @@ COLUMN_TUPLES = [
     ("EN_title", "EN_content"),
 ]
 
-# Yandex API limits (conservative: 50% of official limits)
-# Official: 2000 chars/string, 10K chars/request, 20 req/s, 1M chars/hour
-MAX_CHARS_PER_STRING = 2000       # Max chars per individual text (no change needed)
-MAX_CHARS_PER_REQUEST = 5000      # Conservative: 50% of 10K
-MAX_REQUESTS_PER_SECOND = 10      # Conservative: 50% of 20
-MAX_CHARS_PER_HOUR = 500_000      # Conservative: 50% of 1M
+# Yandex API limits (official)
+MAX_CHARS_PER_STRING = 2000       # Max chars per individual text
+MAX_CHARS_PER_REQUEST = 10000     # Max total chars per API request
+
+# Retry configuration
+MAX_RETRIES = 5
+BASE_RETRY_DELAY = 1.0  # Start with 1 second
 
 
 @dataclass
@@ -50,50 +51,39 @@ class CellItem:
 
 
 class YandexTranslateClient:
-    """Client for Yandex Translate API with conservative rate limiting"""
+    """Client for Yandex Translate API with automatic retry on rate limits"""
 
     API_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
 
     def __init__(self, api_key: str, folder_id: str):
         self.api_key = api_key
         self.folder_id = folder_id
-        self.last_request_time = 0
-        self.request_interval = 1.0 / MAX_REQUESTS_PER_SECOND  # 100ms between requests
-        # Hourly char tracking
-        self.hour_start_time = time.time()
-        self.chars_this_hour = 0
 
-    def _rate_limit(self):
-        """Enforce rate limiting (requests/second)"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.request_interval:
-            time.sleep(self.request_interval - elapsed)
-        self.last_request_time = time.time()
+    def _wait_and_retry(self, response: requests.Response, attempt: int) -> float:
+        """
+        Calculate wait time when rate limited
 
-    def _check_hourly_limit(self, chars_to_send: int):
-        """Check and enforce hourly character limit"""
-        current_time = time.time()
+        Args:
+            response: The 429 response from Yandex
+            attempt: Current retry attempt number
 
-        # Reset counter if hour has passed
-        if current_time - self.hour_start_time >= 3600:
-            self.hour_start_time = current_time
-            self.chars_this_hour = 0
-            logger.info("Hourly character counter reset")
+        Returns:
+            Seconds to wait before retry
+        """
+        # Try to get Retry-After header from Yandex
+        retry_after = response.headers.get('Retry-After')
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
 
-        # Check if we'd exceed the limit
-        if self.chars_this_hour + chars_to_send > MAX_CHARS_PER_HOUR:
-            wait_time = 3600 - (current_time - self.hour_start_time)
-            logger.warning(f"Approaching hourly char limit ({self.chars_this_hour:,}/{MAX_CHARS_PER_HOUR:,})")
-            logger.warning(f"Waiting {wait_time:.0f}s for limit reset...")
-            time.sleep(wait_time + 1)
-            self.hour_start_time = time.time()
-            self.chars_this_hour = 0
-
-        self.chars_this_hour += chars_to_send
+        # Fallback: exponential backoff
+        return BASE_RETRY_DELAY * (2 ** attempt)
 
     def translate(self, texts: List[str], target_lang: str, source_lang: str = "en") -> List[str]:
         """
-        Translate a list of texts to target language
+        Translate a list of texts to target language with automatic retry
 
         Args:
             texts: List of texts to translate
@@ -105,12 +95,6 @@ class YandexTranslateClient:
         """
         if not texts:
             return []
-
-        # Check hourly limit before sending
-        total_chars = sum(len(t) for t in texts)
-        self._check_hourly_limit(total_chars)
-
-        self._rate_limit()
 
         headers = {
             "Content-Type": "application/json",
@@ -124,21 +108,43 @@ class YandexTranslateClient:
             "sourceLanguageCode": source_lang
         }
 
-        try:
-            response = requests.post(self.API_URL, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
+        last_exception = None
 
-            result = response.json()
-            translations = [t["text"] for t in result.get("translations", [])]
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.post(self.API_URL, headers=headers, json=payload, timeout=60)
 
-            if len(translations) != len(texts):
-                logger.warning(f"Translation count mismatch: sent {len(texts)}, got {len(translations)}")
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    wait_time = self._wait_and_retry(response, attempt)
+                    logger.warning(f"Rate limited by Yandex. Waiting {wait_time:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    continue
 
-            return translations
+                # Handle other errors
+                response.raise_for_status()
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Yandex API request failed: {e}")
-            raise
+                result = response.json()
+                translations = [t["text"] for t in result.get("translations", [])]
+
+                if len(translations) != len(texts):
+                    logger.warning(f"Translation count mismatch: sent {len(texts)}, got {len(translations)}")
+
+                return translations
+
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"Request failed: {e}. Retrying in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                continue
+
+        # All retries exhausted
+        logger.error(f"Yandex API request failed after {MAX_RETRIES} attempts")
+        if last_exception:
+            raise last_exception
+        raise Exception("Translation failed: rate limit exceeded")
 
 
 class TranslationManager:
