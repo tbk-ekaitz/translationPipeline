@@ -205,14 +205,16 @@ class YandexTranslateClient:
 
 
 class TranslationManager:
-    """Manages translations to multiple languages"""
+    """Manages translations to multiple languages (always from English)"""
+
+    SOURCE_LANGUAGE = "en"  # Always translate from English
 
     def __init__(self, client: YandexTranslateClient):
         self.client = client
 
     def translate_batch(self, texts: List[str], target_lang: str) -> List[str]:
-        """Translate a batch of texts"""
-        return self.client.translate(texts, target_lang)
+        """Translate a batch of texts from English to target language"""
+        return self.client.translate(texts, target_lang, source_lang=self.SOURCE_LANGUAGE)
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
