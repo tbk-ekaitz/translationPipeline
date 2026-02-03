@@ -30,11 +30,11 @@ segmentation:
 # Translation prompts (placeholders - replace with your actual prompts)
 prompts:
   russian: |
-    [PLACEHOLDER: Insert your English to Russian translation prompt here]
+    Вы профессиональный переводчик, специализирующийся на переводах на русский язык. Переведите следующий текст точно, естественно и идиоматично на русский язык. Сохраните смысл, тон и стиль исходного текста. Предоставьте ТОЛЬКО перевод, без пояснений или дополнительного текста.
     Text to translate: {text}
 
   kazakh: |
-    [PLACEHOLDER: Insert your English to Kazakh translation prompt here]
+    Сіз қазақ тіліне аударуға маманданған кәсіби аудармашысыз. Келесі мәтінді қазақ тіліне (кирилл жазуында) дәл, табиғи және идиоматикалық түрде аударыңыз. Түпнұсқа мәтіннің мағынасын, үнін, мәдени контекстін және стилін сақтаңыз. ТЕК аударманы ұсыныңыз, түсініктемелерсіз немесе қосымша мәтінсіз.
     Text to translate: {text}
 
 # Output configuration
