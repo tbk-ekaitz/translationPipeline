@@ -489,11 +489,21 @@ def process_sheet(
     sheet_name: str,
     column_mappings: dict,
     manager: TranslationManager,
+    languages: List[Tuple[str, str]],
     partial_progress: Optional[PartialProgress] = None,
     existing_results: Optional[Dict] = None
 ) -> Tuple[Optional[pd.DataFrame], Dict]:
     """
     Process a single sheet through the translation pipeline
+
+    Args:
+        df: Source DataFrame
+        sheet_name: Name of the sheet
+        column_mappings: Column name mappings
+        manager: Translation manager
+        languages: List of (lang_code, lang_name) tuples to translate to
+        partial_progress: Progress tracker
+        existing_results: Previously translated results
 
     Returns:
         Tuple of (result DataFrame or None if failed, progress data dict)
@@ -503,11 +513,19 @@ def process_sheet(
 
     for col_info in column_mappings["columns"]:
         source_col = col_info["source"]
-        ru_col = col_info["ru"]
-        kz_col = col_info["kz"]
 
-        # Check if already completed in partial
-        if ru_col in result_data and kz_col in result_data:
+        # Get output column names for selected languages
+        output_cols = {}
+        for lang_code, lang_name in languages:
+            if lang_code == 'ru':
+                output_cols['ru'] = col_info["ru"]
+            elif lang_code == 'kk':
+                output_cols['kz'] = col_info["kz"]
+
+        # Check if all selected languages already completed
+        all_done = all(output_cols.get(k.replace('kk', 'kz')) in result_data
+                       for k, _ in languages)
+        if all_done:
             logger.info(f"[{sheet_name}] Column {source_col} already translated, skipping...")
             continue
 
@@ -524,35 +542,24 @@ def process_sheet(
         # Update progress data
         progress_data['sheets'][sheet_name] = result_data
 
-        # Translate to Russian (if not already done)
-        if ru_col not in result_data:
-            success = translate_cells(
-                cells, "ru", "russian", manager,
-                column_name=source_col,
-                partial_progress=partial_progress,
-                progress_data=progress_data
-            )
-            if not success:
-                result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
-                progress_data['sheets'][sheet_name] = result_data
-                return None, progress_data
+        # Translate to each selected language
+        for lang_code, lang_name in languages:
+            out_col_key = 'ru' if lang_code == 'ru' else 'kz'
+            out_col = output_cols.get(out_col_key)
 
-            result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
+            if out_col and out_col not in result_data:
+                success = translate_cells(
+                    cells, lang_code, lang_name, manager,
+                    column_name=source_col,
+                    partial_progress=partial_progress,
+                    progress_data=progress_data
+                )
+                if not success:
+                    result_data[out_col] = [c.translations.get(lang_name, "") for c in cells]
+                    progress_data['sheets'][sheet_name] = result_data
+                    return None, progress_data
 
-        # Translate to Kazakh (if not already done)
-        if kz_col not in result_data:
-            success = translate_cells(
-                cells, "kk", "kazakh", manager,
-                column_name=source_col,
-                partial_progress=partial_progress,
-                progress_data=progress_data
-            )
-            if not success:
-                result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
-                progress_data['sheets'][sheet_name] = result_data
-                return None, progress_data
-
-            result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+                result_data[out_col] = [c.translations.get(lang_name, "") for c in cells]
 
     return pd.DataFrame(result_data), progress_data
 
@@ -595,8 +602,32 @@ def main():
         action='store_true',
         help='Ignore partial progress and start fresh'
     )
+    parser.add_argument(
+        '--ru',
+        action='store_true',
+        help='Translate to Russian. Use with --kz for both languages'
+    )
+    parser.add_argument(
+        '--kz',
+        action='store_true',
+        help='Translate to Kazakh. Use with --ru for both languages'
+    )
 
     args = parser.parse_args()
+
+    # Validate language flags
+    if not args.ru and not args.kz:
+        print("[ERROR] You must specify at least one language: --ru and/or --kz")
+        print("Example: python pipeline_excel.py data.xlsx --ru --kz")
+        return
+
+    languages = []
+    if args.ru:
+        languages.append(('ru', 'russian'))
+    if args.kz:
+        languages.append(('kk', 'kazakh'))
+
+    logger.info(f"Target languages: {[lang[1] for lang in languages]}")
 
     # Load configuration
     logger.info(f"Loading configuration from {args.config}")
@@ -684,6 +715,7 @@ def main():
         # Process the sheet
         result_df, progress_data = process_sheet(
             df, sheet_name, column_mappings, manager,
+            languages=languages,
             partial_progress=partial_progress,
             existing_results=existing_results
         )
