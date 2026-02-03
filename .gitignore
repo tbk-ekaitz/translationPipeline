@@ -13,6 +13,7 @@ dist/
 *.md
 *.pdf
 *.docx
+input/
 output/
 models/
 *.gguf
