@@ -328,8 +328,8 @@ def process_sheet(
     column_mappings: dict,
     max_tokens: int,
     llm_manager: TranslationLLMManager,
-    russian_batch_size: int,
-    kazakh_batch_size: int,
+    russian_config: dict,
+    kazakh_config: dict,
     russian_prompt: str,
     kazakh_prompt: str
 ) -> pd.DataFrame:
@@ -342,8 +342,8 @@ def process_sheet(
         column_mappings: Dict with column name mappings
         max_tokens: Maximum tokens per chunk
         llm_manager: Translation LLM manager
-        russian_batch_size: Batch size for Russian translation
-        kazakh_batch_size: Batch size for Kazakh translation
+        russian_config: Russian model config (with batch_size_title/content)
+        kazakh_config: Kazakh model config (with batch_size_title/content)
         russian_prompt: Prompt for Russian translation
         kazakh_prompt: Prompt for Kazakh translation
 
@@ -357,7 +357,19 @@ def process_sheet(
         ru_col = col_info["ru"]
         kz_col = col_info["kz"]
 
-        logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ===")
+        # Determine batch size based on column type (title vs content)
+        is_title = "title" in source_col.lower()
+        if is_title:
+            ru_batch = russian_config.get('batch_size_title', russian_config.get('batch_size', 128))
+            kz_batch = kazakh_config.get('batch_size_title', kazakh_config.get('batch_size', 64))
+            col_type = "title"
+        else:
+            ru_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 48))
+            kz_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 16))
+            col_type = "content"
+
+        logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ({col_type}) ===")
+        logger.info(f"Batch sizes: Russian={ru_batch}, Kazakh={kz_batch}")
 
         # Extract cells
         cells = extract_cells_from_column(df, source_col, max_tokens)
@@ -368,7 +380,7 @@ def process_sheet(
         translate_cells_batched(
             cells,
             'russian',
-            russian_batch_size,
+            ru_batch,
             llm_manager.translate_batch_to_russian,
             russian_prompt,
             column_name=source_col
@@ -378,7 +390,7 @@ def process_sheet(
         translate_cells_batched(
             cells,
             'kazakh',
-            kazakh_batch_size,
+            kz_batch,
             llm_manager.translate_batch_to_kazakh,
             kazakh_prompt,
             column_name=source_col
@@ -474,9 +486,6 @@ def main():
 
     llm_manager = TranslationLLMManager(russian_client, kazakh_client)
 
-    # Get batch sizes (support both legacy 'batch_size' and new 'batch_size_content')
-    russian_batch_size = russian_config.get('batch_size_content', russian_config.get('batch_size', 48))
-    kazakh_batch_size = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 16))
     russian_prompt = config['prompts']['russian']
     kazakh_prompt = config['prompts']['kazakh']
     max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
@@ -526,8 +535,8 @@ def main():
             column_mappings,
             max_tokens,
             llm_manager,
-            russian_batch_size,
-            kazakh_batch_size,
+            russian_config,
+            kazakh_config,
             russian_prompt,
             kazakh_prompt
         )

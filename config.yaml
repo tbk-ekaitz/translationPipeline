@@ -17,8 +17,8 @@ llm:
     model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M"
     base_url: "http://localhost:11434"
     # Batch sizes by content type (32B model = more headroom)
-    batch_size_title: 128    # Titles: short texts, minimal KV cache
-    batch_size_content: 48   # Paragraphs: up to 3000 tokens, ~15-20GB extra VRAM
+    batch_size_title: 128    # Titles: short texts, saturate Tensor cores
+    batch_size_content: 64   # Paragraphs: up to 3000 tokens, balanced for 96GB
 
   # Kazakh translation model (KazLLM 70B via Ollama)
   kazakh:
@@ -27,7 +27,7 @@ llm:
     base_url: "http://localhost:11434"
     # Batch sizes by content type (70B model = more conservative)
     batch_size_title: 64     # Titles: short texts, 70B still fits
-    batch_size_content: 16   # Paragraphs: 3000 tokens + 70B = heavy KV cache
+    batch_size_content: 20   # Paragraphs: 3000 tokens + 70B KV cache balance
 
 # Segmentation configuration
 segmentation:
