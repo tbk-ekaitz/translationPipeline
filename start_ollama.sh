@@ -20,8 +20,25 @@ if pgrep -x "ollama" > /dev/null; then
     echo "Stopping existing Ollama process..."
     pkill ollama
     sleep 2
+else
+    echo "No existing Ollama process found."
 fi
 
 # Start Ollama with the configured parallelism
 export OLLAMA_NUM_PARALLEL=$MAX_WORKERS
-exec ollama serve
+echo "Launching Ollama server..."
+ollama serve &
+
+# Wait for server to be ready
+echo "Waiting for Ollama to start..."
+for i in {1..10}; do
+    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        echo "---"
+        echo "✓ Ollama started successfully with OLLAMA_NUM_PARALLEL=$MAX_WORKERS"
+        echo "✓ Server ready at http://localhost:11434"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "Warning: Ollama may not have started correctly. Check logs."
