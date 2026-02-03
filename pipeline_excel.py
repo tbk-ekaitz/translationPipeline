@@ -364,8 +364,8 @@ def process_sheet(
             kz_batch = kazakh_config.get('batch_size_title', kazakh_config.get('batch_size', 64))
             col_type = "title"
         else:
-            ru_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 48))
-            kz_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 16))
+            ru_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 64))
+            kz_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 20))
             col_type = "content"
 
         logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ({col_type}) ===")

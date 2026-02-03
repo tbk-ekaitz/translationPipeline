@@ -132,8 +132,8 @@ def main():
     logger.info("Starting translation process...")
 
     # Get batch sizes (support both legacy 'batch_size' and new 'batch_size_content')
-    russian_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 48))
-    kazakh_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 16))
+    russian_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 64))
+    kazakh_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 20))
 
     orchestrator = TranslationOrchestrator(
         llm_manager,
