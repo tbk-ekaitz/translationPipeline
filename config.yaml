@@ -8,8 +8,8 @@ yandex:
 # LLM Configuration (for pipeline.py - local models)
 llm:
   # Global parallelism setting - should match OLLAMA_NUM_PARALLEL env var
-  # For Blackwell 96GB with 32B + 70B models, 128 is safe for short texts
-  max_workers: 128
+  # 16 is optimal for 70B model KV cache on 96GB VRAM
+  max_workers: 16
 
   # Russian translation model (T-pro 32B via Ollama - Q8_0 for best quality)
   russian:
