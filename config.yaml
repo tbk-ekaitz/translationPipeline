@@ -7,19 +7,27 @@ yandex:
 
 # LLM Configuration (for pipeline.py - local models)
 llm:
-  # Russian translation model (Ollama)
+  # Global parallelism setting - should match OLLAMA_NUM_PARALLEL env var
+  # For Blackwell 96GB with 32B + 70B models, 128 is safe for short texts
+  max_workers: 128
+
+  # Russian translation model (T-pro 32B via Ollama)
   russian:
     type: "ollama"
     model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M"
     base_url: "http://localhost:11434"
-    batch_size: 32  # Batch size for Russian translation (adjust based on model size and VRAM)
+    # Batch sizes by content type (32B model = more headroom)
+    batch_size_title: 128    # Titles: short texts, minimal KV cache
+    batch_size_content: 48   # Paragraphs: up to 3000 tokens, ~15-20GB extra VRAM
 
-  # Kazakh translation model (Ollama)
+  # Kazakh translation model (KazLLM 70B via Ollama)
   kazakh:
     type: "ollama"
     model_name: "kazllm-70b"
     base_url: "http://localhost:11434"
-    batch_size: 16  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
+    # Batch sizes by content type (70B model = more conservative)
+    batch_size_title: 64     # Titles: short texts, 70B still fits
+    batch_size_content: 16   # Paragraphs: 3000 tokens + 70B = heavy KV cache
 
 # Segmentation configuration
 segmentation:

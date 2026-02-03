@@ -103,11 +103,16 @@ def main():
     # Step 3: Initialize LLM clients
     logger.info("Initializing LLM clients...")
 
+    # Global max_workers (should match OLLAMA_NUM_PARALLEL)
+    max_workers = config['llm'].get('max_workers', 16)
+    logger.info(f"Using max_workers={max_workers} (ensure OLLAMA_NUM_PARALLEL={max_workers})")
+
     # Russian model (Ollama)
     russian_config = config['llm']['russian']
     russian_client = OllamaClient(
         model_name=russian_config['model_name'],
-        base_url=russian_config['base_url']
+        base_url=russian_config['base_url'],
+        max_workers=max_workers
     )
     logger.info(f"✓ Russian model ready: {russian_config['model_name']}")
 
@@ -115,7 +120,8 @@ def main():
     kazakh_config = config['llm']['kazakh']
     kazakh_client = OllamaClient(
         model_name=kazakh_config['model_name'],
-        base_url=kazakh_config['base_url']
+        base_url=kazakh_config['base_url'],
+        max_workers=max_workers
     )
     logger.info(f"✓ Kazakh model ready: {kazakh_config['model_name']}")
 
@@ -124,12 +130,17 @@ def main():
 
     # Step 4: Translation
     logger.info("Starting translation process...")
+
+    # Get batch sizes (support both legacy 'batch_size' and new 'batch_size_content')
+    russian_batch = russian_config.get('batch_size_content', russian_config.get('batch_size', 48))
+    kazakh_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 16))
+
     orchestrator = TranslationOrchestrator(
         llm_manager,
         russian_prompt=config['prompts']['russian'],
         kazakh_prompt=config['prompts']['kazakh'],
-        russian_batch_size=russian_config.get('batch_size', 32),
-        kazakh_batch_size=kazakh_config.get('batch_size', 48)
+        russian_batch_size=russian_batch,
+        kazakh_batch_size=kazakh_batch
     )
     translated_sentences = orchestrator.translate_sentences(sentences)
 
