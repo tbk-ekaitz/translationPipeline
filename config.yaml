@@ -11,10 +11,10 @@ llm:
   # For Blackwell 96GB with 32B + 70B models, 128 is safe for short texts
   max_workers: 128
 
-  # Russian translation model (T-pro 32B via Ollama)
+  # Russian translation model (T-pro 32B via Ollama - Q8_0 for best quality)
   russian:
     type: "ollama"
-    model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q4_K_M"
+    model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q8_0"
     base_url: "http://localhost:11434"
     # Batch sizes by content type (32B model = more headroom)
     batch_size_title: 128    # Titles: short texts, saturate Tensor cores
