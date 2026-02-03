@@ -1,6 +1,11 @@
 # Translation Pipeline Configuration
 
-# LLM Configuration
+# Yandex Translate API Configuration (for pipeline_excel.py)
+yandex:
+  api_key: "YOUR_YANDEX_API_KEY"
+  folder_id: "YOUR_FOLDER_ID"
+
+# LLM Configuration (for pipeline.py - local models)
 llm:
   # Russian translation model (Ollama)
   russian:
@@ -12,9 +17,9 @@ llm:
   # Kazakh translation model (Ollama)
   kazakh:
     type: "ollama"
-    model_name: "kazllm-local"
+    model_name: "kazllm-70b"
     base_url: "http://localhost:11434"
-    batch_size: 48  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
+    batch_size: 16  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
 
 # Segmentation configuration
 segmentation:
@@ -25,11 +30,11 @@ segmentation:
 # Translation prompts (placeholders - replace with your actual prompts)
 prompts:
   russian: |
-    [PLACEHOLDER: Insert your English to Russian translation prompt here]
+    Вы профессиональный переводчик, специализирующийся на переводах на русский язык. Переведите следующий текст точно, естественно и идиоматично на русский язык. Сохраните смысл, тон и стиль исходного текста. Предоставьте ТОЛЬКО перевод, без пояснений или дополнительного текста.
     Text to translate: {text}
 
   kazakh: |
-    [PLACEHOLDER: Insert your English to Kazakh translation prompt here]
+    Сіз қазақ тіліне аударуға маманданған кәсіби аудармашысыз. Келесі мәтінді қазақ тіліне (кирилл жазуында) дәл, табиғи және идиоматикалық түрде аударыңыз. Түпнұсқа мәтіннің мағынасын, үнін, мәдени контекстін және стилін сақтаңыз. ТЕК аударманы ұсыныңыз, түсініктемелерсіз немесе қосымша мәтінсіз.
     Text to translate: {text}
 
 # Output configuration
