@@ -5,6 +5,7 @@ Supports multiple models running simultaneously with batch processing
 import requests
 from typing import List, Optional
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class BaseLLMClient(ABC):
@@ -24,17 +25,20 @@ class BaseLLMClient(ABC):
 class OllamaClient(BaseLLMClient):
     """Client for Ollama API"""
 
-    def __init__(self, model_name: str, base_url: str = "http://localhost:11434"):
+    def __init__(self, model_name: str, base_url: str = "http://localhost:11434", max_workers: int = 16):
         """
         Initialize Ollama client
 
         Args:
             model_name: Name of the Ollama model
             base_url: Base URL for Ollama API
+            max_workers: Max parallel requests for batch processing (default 16).
+                         Should match OLLAMA_NUM_PARALLEL env var in Ollama server.
         """
         self.model_name = model_name
         self.base_url = base_url
         self.api_url = f"{base_url}/api/generate"
+        self.max_workers = max_workers
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         """
@@ -66,39 +70,53 @@ class OllamaClient(BaseLLMClient):
 
     def generate_batch(self, prompts: List[str], system_prompt: str = "") -> List[str]:
         """
-        Generate text from multiple prompts in batch
-        Model stays loaded in GPU, so sequential calls are efficient
+        Generate text from multiple prompts in parallel using ThreadPoolExecutor.
+        Requires Ollama server started with OLLAMA_NUM_PARALLEL env var set.
 
         Args:
             prompts: List of user prompts
             system_prompt: System prompt (optional)
 
         Returns:
-            List of generated texts
+            List of generated texts in same order as input prompts
         """
-        results = []
-        for prompt in prompts:
+        if not prompts:
+            return []
+
+        # Pre-allocate results list to maintain order
+        results = [None] * len(prompts)
+
+        def process_prompt(index_prompt):
+            idx, prompt = index_prompt
             try:
-                result = self.generate(prompt, system_prompt)
-                results.append(result)
+                return idx, self.generate(prompt, system_prompt)
             except Exception as e:
-                # On error, add error message but continue processing
-                results.append(f"[ERROR: {str(e)}]")
+                return idx, f"[ERROR: {str(e)}]"
+
+        # Use ThreadPoolExecutor for parallel HTTP requests
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = executor.map(process_prompt, enumerate(prompts))
+            for idx, result in futures:
+                results[idx] = result
+
         return results
 
 
 class LlamaCppClient(BaseLLMClient):
     """Client for llama.cpp server"""
 
-    def __init__(self, base_url: str = "http://localhost:8080"):
+    def __init__(self, base_url: str = "http://localhost:8080", max_workers: int = 16):
         """
         Initialize llama.cpp client
 
         Args:
             base_url: Base URL for llama.cpp server
+            max_workers: Max parallel requests for batch processing (default 16).
+                         Should match --parallel flag in llama-server.
         """
         self.base_url = base_url
         self.api_url = f"{base_url}/completion"
+        self.max_workers = max_workers
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         """
@@ -134,24 +152,35 @@ class LlamaCppClient(BaseLLMClient):
 
     def generate_batch(self, prompts: List[str], system_prompt: str = "") -> List[str]:
         """
-        Generate text from multiple prompts in batch
-        Model stays loaded in GPU, so sequential calls are efficient
+        Generate text from multiple prompts in parallel using ThreadPoolExecutor.
+        Requires llama-server started with --parallel flag.
 
         Args:
             prompts: List of user prompts
             system_prompt: System prompt (optional)
 
         Returns:
-            List of generated texts in same order as input
+            List of generated texts in same order as input prompts
         """
-        results = []
-        for prompt in prompts:
+        if not prompts:
+            return []
+
+        # Pre-allocate results list to maintain order
+        results = [None] * len(prompts)
+
+        def process_prompt(index_prompt):
+            idx, prompt = index_prompt
             try:
-                result = self.generate(prompt, system_prompt)
-                results.append(result)
+                return idx, self.generate(prompt, system_prompt)
             except Exception as e:
-                # On error, add error message but continue processing
-                results.append(f"[ERROR: {str(e)}]")
+                return idx, f"[ERROR: {str(e)}]"
+
+        # Use ThreadPoolExecutor for parallel HTTP requests
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = executor.map(process_prompt, enumerate(prompts))
+            for idx, result in futures:
+                results[idx] = result
+
         return results
 
 
