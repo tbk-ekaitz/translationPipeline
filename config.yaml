@@ -17,9 +17,9 @@ llm:
   # Kazakh translation model (Ollama)
   kazakh:
     type: "ollama"
-    model_name: "kazllm-local"
+    model_name: "kazllm-70b"
     base_url: "http://localhost:11434"
-    batch_size: 48  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
+    batch_size: 16  # Batch size for Kazakh translation (KazLLM-8B is smaller, can handle larger batches)
 
 # Segmentation configuration
 segmentation:
