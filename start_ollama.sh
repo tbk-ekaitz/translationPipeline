@@ -9,7 +9,7 @@ CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 # (Each model can have different max_workers for optimal parallelism)
 ALL_WORKERS=$(grep -E '^\s*max_workers:' "$CONFIG_FILE" | awk '{print $2}')
 
-MAX_WORKERS=16  # Default
+MAX_WORKERS=14  # Default
 for w in $ALL_WORKERS; do
     if [ "$w" -gt "$MAX_WORKERS" ] 2>/dev/null; then
         MAX_WORKERS=$w

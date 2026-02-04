@@ -13,7 +13,7 @@ llm:
     model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q8_0"
     base_url: "http://localhost:11434"
     # 32B model can handle more parallelism
-    max_workers: 32
+    max_workers: 14
     # Batch sizes by content type (32B model = more headroom)
     batch_size_title: 128    # Titles: short texts, saturate Tensor cores
     batch_size_content: 64   # Paragraphs: up to 3000 tokens, balanced for 96GB
@@ -24,10 +24,10 @@ llm:
     model_name: "kazllm-70b"
     base_url: "http://localhost:11434"
     # 70B model needs lower parallelism for KV cache
-    max_workers: 16
+    max_workers: 14
     # Batch sizes by content type (70B model = more conservative)
-    batch_size_title: 64     # Titles: short texts, 70B still fits
-    batch_size_content: 20   # Paragraphs: 3000 tokens + 70B KV cache balance
+    batch_size_title: 4088     # Titles: short texts, 70B still fits
+    batch_size_content: 14   # Paragraphs: 3000 tokens + 70B KV cache balance
 
 # Segmentation configuration
 segmentation:
@@ -63,7 +63,7 @@ prompts:
 # Output configuration
 output:
   # Directory for output files
-  directory: "./output"
+  directory: "./output-kz"
 
   # Generate both JSON and readable text formats
   formats:
