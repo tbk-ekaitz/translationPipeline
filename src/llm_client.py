@@ -40,6 +40,21 @@ class OllamaClient(BaseLLMClient):
         self.api_url = f"{base_url}/api/generate"
         self.max_workers = max_workers
 
+    def unload_model(self):
+        """
+        Unload model from GPU memory.
+        Call this after finishing with a model to free VRAM for other models.
+        """
+        payload = {
+            "model": self.model_name,
+            "keep_alive": 0
+        }
+        try:
+            response = requests.post(self.api_url, json=payload, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.RequestException:
+            pass  # Ignore errors, model might already be unloaded
+
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         """
         Generate text using Ollama API
@@ -197,6 +212,16 @@ class TranslationLLMManager:
         """
         self.russian_client = russian_client
         self.kazakh_client = kazakh_client
+
+    def unload_russian(self):
+        """Unload Russian model from GPU memory"""
+        if self.russian_client and hasattr(self.russian_client, 'unload_model'):
+            self.russian_client.unload_model()
+
+    def unload_kazakh(self):
+        """Unload Kazakh model from GPU memory"""
+        if self.kazakh_client and hasattr(self.kazakh_client, 'unload_model'):
+            self.kazakh_client.unload_model()
 
     def translate_to_russian(self, text: str, prompt_template: str) -> str:
         """

@@ -503,12 +503,20 @@ def process_sheet(
                     df, source_col, chunker, 'russian',
                     ru_batch, llm_manager.translate_batch_to_russian, russian_prompt
                 )
+                # Unload Russian model to free VRAM for Kazakh
+                if do_kazakh:
+                    logger.info("Unloading Russian model to free VRAM...")
+                    llm_manager.unload_russian()
 
             if do_kazakh:
                 kz_translations = translate_column_balanced(
                     df, source_col, chunker, 'kazakh',
                     kz_batch, llm_manager.translate_batch_to_kazakh, kazakh_prompt
                 )
+                # Unload Kazakh model to free VRAM for next column's Russian
+                if do_russian:
+                    logger.info("Unloading Kazakh model to free VRAM...")
+                    llm_manager.unload_kazakh()
 
             # Store results
             if do_russian:
@@ -531,6 +539,10 @@ def process_sheet(
                     russian_prompt,
                     column_name=source_col
                 )
+                # Unload Russian model to free VRAM for Kazakh
+                if do_kazakh:
+                    logger.info("Unloading Russian model to free VRAM...")
+                    llm_manager.unload_russian()
 
             if do_kazakh:
                 translate_cells_batched(
@@ -541,6 +553,10 @@ def process_sheet(
                     kazakh_prompt,
                     column_name=source_col
                 )
+                # Unload Kazakh model to free VRAM for next column's Russian
+                if do_russian:
+                    logger.info("Unloading Kazakh model to free VRAM...")
+                    llm_manager.unload_kazakh()
 
             # Store results from cells
             if do_russian:
