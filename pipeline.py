@@ -103,27 +103,25 @@ def main():
     # Step 3: Initialize LLM clients
     logger.info("Initializing LLM clients...")
 
-    # Global max_workers (should match OLLAMA_NUM_PARALLEL)
-    max_workers = config['llm'].get('max_workers', 16)
-    logger.info(f"Using max_workers={max_workers} (ensure OLLAMA_NUM_PARALLEL={max_workers})")
-
     # Russian model (Ollama)
     russian_config = config['llm']['russian']
+    russian_max_workers = russian_config.get('max_workers', 32)
     russian_client = OllamaClient(
         model_name=russian_config['model_name'],
         base_url=russian_config['base_url'],
-        max_workers=max_workers
+        max_workers=russian_max_workers
     )
-    logger.info(f"✓ Russian model ready: {russian_config['model_name']}")
+    logger.info(f"✓ Russian model ready: {russian_config['model_name']} (max_workers={russian_max_workers})")
 
     # Kazakh model (Ollama)
     kazakh_config = config['llm']['kazakh']
+    kazakh_max_workers = kazakh_config.get('max_workers', 16)
     kazakh_client = OllamaClient(
         model_name=kazakh_config['model_name'],
         base_url=kazakh_config['base_url'],
-        max_workers=max_workers
+        max_workers=kazakh_max_workers
     )
-    logger.info(f"✓ Kazakh model ready: {kazakh_config['model_name']}")
+    logger.info(f"✓ Kazakh model ready: {kazakh_config['model_name']} (max_workers={kazakh_max_workers})")
 
     # Create LLM manager
     llm_manager = TranslationLLMManager(russian_client, kazakh_client)

@@ -7,15 +7,13 @@ yandex:
 
 # LLM Configuration (for pipeline.py - local models)
 llm:
-  # Global parallelism setting - should match OLLAMA_NUM_PARALLEL env var
-  # 16 is optimal for 70B model KV cache on 96GB VRAM
-  max_workers: 16
-
   # Russian translation model (T-pro 32B via Ollama - Q8_0 for best quality)
   russian:
     type: "ollama"
     model_name: "hf.co/t-tech/T-pro-it-2.0-GGUF:Q8_0"
     base_url: "http://localhost:11434"
+    # 32B model can handle more parallelism
+    max_workers: 32
     # Batch sizes by content type (32B model = more headroom)
     batch_size_title: 128    # Titles: short texts, saturate Tensor cores
     batch_size_content: 64   # Paragraphs: up to 3000 tokens, balanced for 96GB
@@ -25,6 +23,8 @@ llm:
     type: "ollama"
     model_name: "kazllm-70b"
     base_url: "http://localhost:11434"
+    # 70B model needs lower parallelism for KV cache
+    max_workers: 16
     # Batch sizes by content type (70B model = more conservative)
     batch_size_title: 64     # Titles: short texts, 70B still fits
     batch_size_content: 20   # Paragraphs: 3000 tokens + 70B KV cache balance

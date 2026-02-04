@@ -1,14 +1,22 @@
 #!/bin/bash
 # Start Ollama with OLLAMA_NUM_PARALLEL from config.yaml
+# Uses the maximum max_workers from all models
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 
-# Extract max_workers from config.yaml
-MAX_WORKERS=$(grep -E '^\s*max_workers:' "$CONFIG_FILE" | head -1 | awk '{print $2}')
+# Extract all max_workers values and find the maximum
+# (Each model can have different max_workers for optimal parallelism)
+ALL_WORKERS=$(grep -E '^\s*max_workers:' "$CONFIG_FILE" | awk '{print $2}')
 
-if [ -z "$MAX_WORKERS" ]; then
-    MAX_WORKERS=16
+MAX_WORKERS=16  # Default
+for w in $ALL_WORKERS; do
+    if [ "$w" -gt "$MAX_WORKERS" ] 2>/dev/null; then
+        MAX_WORKERS=$w
+    fi
+done
+
+if [ -z "$ALL_WORKERS" ]; then
     echo "Warning: max_workers not found in config.yaml, using default: $MAX_WORKERS"
 fi
 

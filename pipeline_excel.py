@@ -331,7 +331,9 @@ def process_sheet(
     russian_config: dict,
     kazakh_config: dict,
     russian_prompt: str,
-    kazakh_prompt: str
+    kazakh_prompt: str,
+    do_russian: bool = True,
+    do_kazakh: bool = True
 ) -> pd.DataFrame:
     """
     Process a single sheet through the translation pipeline
@@ -346,6 +348,8 @@ def process_sheet(
         kazakh_config: Kazakh model config (with batch_size_title/content)
         russian_prompt: Prompt for Russian translation
         kazakh_prompt: Prompt for Kazakh translation
+        do_russian: Whether to translate to Russian
+        do_kazakh: Whether to translate to Kazakh
 
     Returns:
         DataFrame with translated columns
@@ -369,7 +373,12 @@ def process_sheet(
             col_type = "content"
 
         logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ({col_type}) ===")
-        logger.info(f"Batch sizes: Russian={ru_batch}, Kazakh={kz_batch}")
+        if do_russian and do_kazakh:
+            logger.info(f"Batch sizes: Russian={ru_batch}, Kazakh={kz_batch}")
+        elif do_russian:
+            logger.info(f"Batch size: Russian={ru_batch} (Kazakh skipped)")
+        else:
+            logger.info(f"Batch size: Kazakh={kz_batch} (Russian skipped)")
 
         # Extract cells
         cells = extract_cells_from_column(df, source_col, max_tokens)
@@ -377,28 +386,32 @@ def process_sheet(
         logger.info(f"Extracted {len(cells)} cells ({chunked_count} chunked)")
 
         # Translate to Russian
-        translate_cells_batched(
-            cells,
-            'russian',
-            ru_batch,
-            llm_manager.translate_batch_to_russian,
-            russian_prompt,
-            column_name=source_col
-        )
+        if do_russian:
+            translate_cells_batched(
+                cells,
+                'russian',
+                ru_batch,
+                llm_manager.translate_batch_to_russian,
+                russian_prompt,
+                column_name=source_col
+            )
 
         # Translate to Kazakh
-        translate_cells_batched(
-            cells,
-            'kazakh',
-            kz_batch,
-            llm_manager.translate_batch_to_kazakh,
-            kazakh_prompt,
-            column_name=source_col
-        )
+        if do_kazakh:
+            translate_cells_batched(
+                cells,
+                'kazakh',
+                kz_batch,
+                llm_manager.translate_batch_to_kazakh,
+                kazakh_prompt,
+                column_name=source_col
+            )
 
         # Store results
-        result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
-        result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+        if do_russian:
+            result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
+        if do_kazakh:
+            result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
 
     return pd.DataFrame(result_data)
 
@@ -446,6 +459,18 @@ def main():
              'Example: --columns "Title" "Description" "Notes"',
         default=None
     )
+    parser.add_argument(
+        '--ru', '--russian',
+        action='store_true',
+        dest='russian_only',
+        help='Only translate to Russian (skip Kazakh)'
+    )
+    parser.add_argument(
+        '--kz', '--kazakh',
+        action='store_true',
+        dest='kazakh_only',
+        help='Only translate to Kazakh (skip Russian)'
+    )
 
     args = parser.parse_args()
 
@@ -464,25 +489,39 @@ def main():
     # Step 2: Initialize LLM clients
     logger.info("Initializing LLM clients...")
 
-    # Global max_workers (should match OLLAMA_NUM_PARALLEL)
-    max_workers = config['llm'].get('max_workers', 16)
-    logger.info(f"Using max_workers={max_workers} (ensure OLLAMA_NUM_PARALLEL={max_workers})")
+    # Determine which languages to process
+    do_russian = not args.kazakh_only
+    do_kazakh = not args.russian_only
+
+    if args.russian_only and args.kazakh_only:
+        logger.error("Cannot use both --ru and --kz flags together")
+        return
 
     russian_config = config['llm']['russian']
-    russian_client = OllamaClient(
-        model_name=russian_config['model_name'],
-        base_url=russian_config['base_url'],
-        max_workers=max_workers
-    )
-    logger.info(f"Russian model ready: {russian_config['model_name']}")
-
     kazakh_config = config['llm']['kazakh']
-    kazakh_client = OllamaClient(
-        model_name=kazakh_config['model_name'],
-        base_url=kazakh_config['base_url'],
-        max_workers=max_workers
-    )
-    logger.info(f"Kazakh model ready: {kazakh_config['model_name']}")
+
+    # Per-model max_workers (each model has its own optimal parallelism)
+    russian_max_workers = russian_config.get('max_workers', 32)
+    kazakh_max_workers = kazakh_config.get('max_workers', 16)
+
+    russian_client = None
+    kazakh_client = None
+
+    if do_russian:
+        russian_client = OllamaClient(
+            model_name=russian_config['model_name'],
+            base_url=russian_config['base_url'],
+            max_workers=russian_max_workers
+        )
+        logger.info(f"Russian model ready: {russian_config['model_name']} (max_workers={russian_max_workers})")
+
+    if do_kazakh:
+        kazakh_client = OllamaClient(
+            model_name=kazakh_config['model_name'],
+            base_url=kazakh_config['base_url'],
+            max_workers=kazakh_max_workers
+        )
+        logger.info(f"Kazakh model ready: {kazakh_config['model_name']} (max_workers={kazakh_max_workers})")
 
     llm_manager = TranslationLLMManager(russian_client, kazakh_client)
 
@@ -538,7 +577,9 @@ def main():
             russian_config,
             kazakh_config,
             russian_prompt,
-            kazakh_prompt
+            kazakh_prompt,
+            do_russian=do_russian,
+            do_kazakh=do_kazakh
         )
 
         output_sheets[sheet_name] = result_df
