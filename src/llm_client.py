@@ -61,7 +61,7 @@ class OllamaClient(BaseLLMClient):
             payload["system"] = system_prompt
 
         try:
-            response = requests.post(self.api_url, json=payload, timeout=300)
+            response = requests.post(self.api_url, json=payload, timeout=600)
             response.raise_for_status()
             result = response.json()
             return result.get("response", "").strip()
@@ -143,7 +143,7 @@ class LlamaCppClient(BaseLLMClient):
         }
 
         try:
-            response = requests.post(self.api_url, json=payload, timeout=300)
+            response = requests.post(self.api_url, json=payload, timeout=600)
             response.raise_for_status()
             result = response.json()
             return result.get("content", "").strip()
