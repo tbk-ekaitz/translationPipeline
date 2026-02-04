@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 COLUMN_TUPLES = [
     ("en-title", "en-content"),
     ("EN_title", "EN_content"),
+    ("en_title", "en_content"),
+    ("EN-title", "EN-content"),
 ]
 
 
