@@ -16,6 +16,7 @@ import pandas as pd
 
 from src.llm_client import OllamaClient, TranslationLLMManager
 from src.sentence_segmenter import SentenceSegmenter
+from src.balanced_chunker import BalancedChunker, create_chunker_from_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -324,6 +325,112 @@ def merge_chunk_translations(chunk_trans: List[str]) -> str:
     return merged.strip()
 
 
+def translate_column_balanced(
+    df: pd.DataFrame,
+    column_name: str,
+    chunker: BalancedChunker,
+    language: str,
+    batch_size: int,
+    translate_func,
+    prompt_template: str
+) -> List[str]:
+    """
+    Translate a column using balanced chunking for optimal parallelism.
+
+    Args:
+        df: Source DataFrame
+        column_name: Name of the column to translate
+        chunker: BalancedChunker instance
+        language: Target language name ('russian' or 'kazakh')
+        batch_size: Size of each batch
+        translate_func: Translation function to use
+        prompt_template: Prompt template for translation
+
+    Returns:
+        List of translations matching row order
+    """
+    from tqdm import tqdm
+
+    # Extract all texts from column
+    texts = []
+    for value in df[column_name]:
+        text = str(value) if pd.notna(value) else ""
+        texts.append(text.strip())
+
+    total_cells = len(texts)
+    all_translations = [""] * total_cells
+
+    # Process in batches
+    num_batches = (total_cells + batch_size - 1) // batch_size
+
+    desc = f"[{column_name}] -> {language.capitalize()} (balanced)"
+    progress_bar = tqdm(
+        range(num_batches),
+        desc=desc,
+        unit="batch",
+        ncols=100
+    )
+
+    for batch_idx in progress_bar:
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, total_cells)
+        batch_texts = texts[start_idx:end_idx]
+
+        progress_bar.set_postfix({
+            'cells': f'{start_idx + 1}-{end_idx}/{total_cells}'
+        })
+
+        # Create balanced chunks for this batch
+        balanced_batch = chunker.process_batch(batch_texts)
+
+        # Log batch statistics
+        if balanced_batch.max_chunk_tokens > 0:
+            logger.debug(
+                f"Batch {batch_idx + 1}: {len(balanced_batch.chunks)} chunks, "
+                f"tokens: avg={balanced_batch.avg_chunk_tokens}, "
+                f"min={balanced_batch.min_chunk_tokens}, "
+                f"max={balanced_batch.max_chunk_tokens}"
+            )
+
+        # Extract non-empty chunk texts for translation
+        chunk_texts = [c.text for c in balanced_batch.chunks if c.text]
+
+        if chunk_texts:
+            try:
+                # Translate all chunks in batch
+                chunk_translations = translate_func(chunk_texts, prompt_template)
+
+                # Map translations back to chunks (handling empty chunks)
+                full_translations = []
+                trans_idx = 0
+                for chunk in balanced_batch.chunks:
+                    if chunk.text:
+                        full_translations.append(chunk_translations[trans_idx])
+                        trans_idx += 1
+                    else:
+                        full_translations.append("")
+
+                # Reassemble translations to cell level
+                cell_translations = chunker.reassemble_translations(
+                    balanced_batch,
+                    full_translations
+                )
+
+                # Store in results
+                for local_idx, translation in enumerate(cell_translations):
+                    global_idx = start_idx + local_idx
+                    all_translations[global_idx] = translation
+
+            except Exception as e:
+                logger.error(f"Batch translation failed: {e}")
+                for local_idx in range(len(batch_texts)):
+                    global_idx = start_idx + local_idx
+                    if batch_texts[local_idx]:
+                        all_translations[global_idx] = f"[ERROR: {str(e)}]"
+
+    return all_translations
+
+
 def process_sheet(
     df: pd.DataFrame,
     sheet_name: str,
@@ -335,7 +442,8 @@ def process_sheet(
     russian_prompt: str,
     kazakh_prompt: str,
     do_russian: bool = True,
-    do_kazakh: bool = True
+    do_kazakh: bool = True,
+    chunker: Optional[BalancedChunker] = None
 ) -> pd.DataFrame:
     """
     Process a single sheet through the translation pipeline
@@ -352,11 +460,13 @@ def process_sheet(
         kazakh_prompt: Prompt for Kazakh translation
         do_russian: Whether to translate to Russian
         do_kazakh: Whether to translate to Kazakh
+        chunker: BalancedChunker for balanced mode (None = legacy mode)
 
     Returns:
         DataFrame with translated columns
     """
     result_data = {}
+    use_balanced = chunker is not None
 
     for col_info in column_mappings["columns"]:
         source_col = col_info["source"]
@@ -374,7 +484,8 @@ def process_sheet(
             kz_batch = kazakh_config.get('batch_size_content', kazakh_config.get('batch_size', 20))
             col_type = "content"
 
-        logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ({col_type}) ===")
+        mode_str = "balanced" if use_balanced else "legacy"
+        logger.info(f"\n=== [{sheet_name}] Processing column: {source_col} ({col_type}, {mode_str}) ===")
         if do_russian and do_kazakh:
             logger.info(f"Batch sizes: Russian={ru_batch}, Kazakh={kz_batch}")
         elif do_russian:
@@ -382,38 +493,60 @@ def process_sheet(
         else:
             logger.info(f"Batch size: Kazakh={kz_batch} (Russian skipped)")
 
-        # Extract cells
-        cells = extract_cells_from_column(df, source_col, max_tokens)
-        chunked_count = sum(1 for c in cells if c.chunks)
-        logger.info(f"Extracted {len(cells)} cells ({chunked_count} chunked)")
+        if use_balanced:
+            # Balanced chunking mode
+            ru_translations = []
+            kz_translations = []
 
-        # Translate to Russian
-        if do_russian:
-            translate_cells_batched(
-                cells,
-                'russian',
-                ru_batch,
-                llm_manager.translate_batch_to_russian,
-                russian_prompt,
-                column_name=source_col
-            )
+            if do_russian:
+                ru_translations = translate_column_balanced(
+                    df, source_col, chunker, 'russian',
+                    ru_batch, llm_manager.translate_batch_to_russian, russian_prompt
+                )
 
-        # Translate to Kazakh
-        if do_kazakh:
-            translate_cells_batched(
-                cells,
-                'kazakh',
-                kz_batch,
-                llm_manager.translate_batch_to_kazakh,
-                kazakh_prompt,
-                column_name=source_col
-            )
+            if do_kazakh:
+                kz_translations = translate_column_balanced(
+                    df, source_col, chunker, 'kazakh',
+                    kz_batch, llm_manager.translate_batch_to_kazakh, kazakh_prompt
+                )
 
-        # Store results
-        if do_russian:
-            result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
-        if do_kazakh:
-            result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+            # Store results
+            if do_russian:
+                result_data[ru_col] = ru_translations
+            if do_kazakh:
+                result_data[kz_col] = kz_translations
+
+        else:
+            # Legacy mode
+            cells = extract_cells_from_column(df, source_col, max_tokens)
+            chunked_count = sum(1 for c in cells if c.chunks)
+            logger.info(f"Extracted {len(cells)} cells ({chunked_count} chunked)")
+
+            if do_russian:
+                translate_cells_batched(
+                    cells,
+                    'russian',
+                    ru_batch,
+                    llm_manager.translate_batch_to_russian,
+                    russian_prompt,
+                    column_name=source_col
+                )
+
+            if do_kazakh:
+                translate_cells_batched(
+                    cells,
+                    'kazakh',
+                    kz_batch,
+                    llm_manager.translate_batch_to_kazakh,
+                    kazakh_prompt,
+                    column_name=source_col
+                )
+
+            # Store results from cells
+            if do_russian:
+                result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
+            if do_kazakh:
+                result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
 
     return pd.DataFrame(result_data)
 
@@ -531,6 +664,17 @@ def main():
     kazakh_prompt = config['prompts']['kazakh']
     max_tokens = config.get('segmentation', {}).get('max_tokens', 3000)
 
+    # Initialize balanced chunker if enabled
+    seg_config = config.get('segmentation', {})
+    use_balanced = seg_config.get('balance_batches', False)
+    chunker = None
+
+    if use_balanced:
+        chunker = create_chunker_from_config(config)
+        logger.info(f"Balanced chunking enabled: target_ratio={seg_config.get('target_ratio', 0.8)}")
+    else:
+        logger.info("Using legacy chunking mode")
+
     # Step 3: Process each sheet
     output_sheets = {}
     use_custom_columns = args.columns is not None
@@ -581,7 +725,8 @@ def main():
             russian_prompt,
             kazakh_prompt,
             do_russian=do_russian,
-            do_kazakh=do_kazakh
+            do_kazakh=do_kazakh,
+            chunker=chunker
         )
 
         output_sheets[sheet_name] = result_df

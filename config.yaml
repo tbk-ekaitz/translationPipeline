@@ -31,9 +31,24 @@ llm:
 
 # Segmentation configuration
 segmentation:
-  # Maximum tokens per sentence before splitting
+  # Maximum tokens per chunk (hard limit)
   # Safe values: 3000 for num_ctx=8192, 6000 for num_ctx=16384
   max_tokens: 3000
+
+  # Balanced chunking: creates uniform chunk sizes for better parallelism
+  balance_batches: true
+
+  # Target chunk size as ratio of max_tokens (0.8 = aim for 80% of max)
+  target_ratio: 0.8
+
+  # Weights for cut points (higher = better place to cut)
+  # Greedy algorithm prefers cutting at higher-weight points
+  cut_weights:
+    period: 1.0      # . ! ? - best cut points
+    semicolon: 0.7   # ;
+    colon: 0.6       # :
+    comma: 0.4       # ,
+    space: 0.1       # (space) - last resort
 
 # Translation prompts (placeholders - replace with your actual prompts)
 prompts:
