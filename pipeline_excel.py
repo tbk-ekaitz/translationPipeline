@@ -5,6 +5,8 @@ Translates specific columns from xlsx/csv files to Russian and Kazakh
 Supports multi-sheet xlsx files and custom column selection
 """
 import argparse
+import hashlib
+import json
 import logging
 import yaml
 from pathlib import Path
@@ -13,6 +15,165 @@ from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass, field
 
 import pandas as pd
+
+
+class CheckpointManager:
+    """Manages checkpoint files for resuming interrupted translations"""
+
+    def __init__(self, input_file: str, config: dict, output_dir: str):
+        self.input_file = Path(input_file).name
+        self.input_stem = Path(input_file).stem
+        self.output_dir = Path(output_dir)
+        self.checkpoint_path = self.output_dir / f"{self.input_stem}.temp"
+        self.config = config
+        self.config_hash = self._compute_config_hash(config)
+        self.data = None
+
+    def _compute_config_hash(self, config: dict) -> str:
+        """Compute hash of relevant config sections"""
+        relevant = {
+            'llm': config.get('llm', {}),
+            'prompts': config.get('prompts', {}),
+            'segmentation': config.get('segmentation', {})
+        }
+        config_str = json.dumps(relevant, sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()
+
+    def load_or_create(self, total_sheets: int, sheet_names: List[str]) -> bool:
+        """
+        Load existing checkpoint or create new one.
+
+        Returns:
+            True if resuming from existing checkpoint, False if starting fresh
+        """
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.checkpoint_path.exists():
+            try:
+                with open(self.checkpoint_path, 'r', encoding='utf-8') as f:
+                    self.data = json.load(f)
+
+                # Verify config matches
+                if self.data.get('config_hash') == self.config_hash:
+                    logger.info(f"Resuming from checkpoint: {self.checkpoint_path}")
+                    return True
+                else:
+                    logger.warning("Config changed since last run. Starting fresh.")
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Invalid checkpoint file, starting fresh: {e}")
+
+        # Create new checkpoint
+        self.data = {
+            'original_file': self.input_file,
+            'config_hash': self.config_hash,
+            'total_sheets': total_sheets,
+            'sheets_progress': {}
+        }
+
+        for sheet_name in sheet_names:
+            self.data['sheets_progress'][sheet_name] = {
+                'status': 'pending',
+                'columns_progress': {}
+            }
+
+        self._save()
+        return False
+
+    def _save(self):
+        """Save checkpoint to disk"""
+        with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def get_sheet_status(self, sheet_name: str) -> str:
+        """Get status of a sheet: 'pending', 'in_progress', or 'completed'"""
+        sheet_data = self.data['sheets_progress'].get(sheet_name, {})
+        return sheet_data.get('status', 'pending')
+
+    def get_column_progress(self, sheet_name: str, column_name: str, language: str) -> dict:
+        """
+        Get progress for a specific column/language combination.
+
+        Returns:
+            Dict with 'completed_batches', 'total_batches', 'translations'
+        """
+        sheet_data = self.data['sheets_progress'].get(sheet_name, {})
+        columns = sheet_data.get('columns_progress', {})
+        col_key = f"{column_name}_{language}"
+
+        return columns.get(col_key, {
+            'completed_batches': 0,
+            'total_batches': 0,
+            'translations': []
+        })
+
+    def save_batch_progress(
+        self,
+        sheet_name: str,
+        column_name: str,
+        language: str,
+        batch_idx: int,
+        total_batches: int,
+        translations: List[str]
+    ):
+        """Save progress after completing a batch"""
+        if sheet_name not in self.data['sheets_progress']:
+            self.data['sheets_progress'][sheet_name] = {
+                'status': 'in_progress',
+                'columns_progress': {}
+            }
+
+        sheet_data = self.data['sheets_progress'][sheet_name]
+        sheet_data['status'] = 'in_progress'
+
+        col_key = f"{column_name}_{language}"
+        sheet_data['columns_progress'][col_key] = {
+            'completed_batches': batch_idx + 1,
+            'total_batches': total_batches,
+            'translations': translations
+        }
+
+        self._save()
+
+    def mark_sheet_completed(self, sheet_name: str):
+        """Mark a sheet as fully completed"""
+        if sheet_name in self.data['sheets_progress']:
+            self.data['sheets_progress'][sheet_name]['status'] = 'completed'
+            self._save()
+
+    def cleanup(self):
+        """Remove checkpoint file after successful completion"""
+        if self.checkpoint_path.exists():
+            self.checkpoint_path.unlink()
+            logger.info(f"Checkpoint cleaned up: {self.checkpoint_path}")
+
+    def get_summary(self) -> str:
+        """Get a human-readable summary of progress"""
+        total = self.data['total_sheets']
+        completed = sum(
+            1 for s in self.data['sheets_progress'].values()
+            if s.get('status') == 'completed'
+        )
+        in_progress = sum(
+            1 for s in self.data['sheets_progress'].values()
+            if s.get('status') == 'in_progress'
+        )
+
+        lines = [
+            f"Checkpoint: {self.checkpoint_path}",
+            f"Original file: {self.data['original_file']}",
+            f"Sheets: {completed}/{total} completed, {in_progress} in progress"
+        ]
+
+        for sheet_name, sheet_data in self.data['sheets_progress'].items():
+            status = sheet_data.get('status', 'pending')
+            if status == 'in_progress':
+                cols = sheet_data.get('columns_progress', {})
+                for col_key, col_data in cols.items():
+                    done = col_data.get('completed_batches', 0)
+                    total_b = col_data.get('total_batches', 0)
+                    lines.append(f"  [{sheet_name}] {col_key}: batch {done}/{total_b}")
+
+        return "\n".join(lines)
 
 from src.llm_client import OllamaClient, TranslationLLMManager
 from src.sentence_segmenter import SentenceSegmenter
@@ -332,7 +493,9 @@ def translate_column_balanced(
     language: str,
     batch_size: int,
     translate_func,
-    prompt_template: str
+    prompt_template: str,
+    checkpoint: Optional['CheckpointManager'] = None,
+    sheet_name: str = ""
 ) -> List[str]:
     """
     Translate a column using balanced chunking for optimal parallelism.
@@ -345,6 +508,8 @@ def translate_column_balanced(
         batch_size: Size of each batch
         translate_func: Translation function to use
         prompt_template: Prompt template for translation
+        checkpoint: Optional CheckpointManager for saving progress
+        sheet_name: Name of the sheet (for checkpoint)
 
     Returns:
         List of translations matching row order
@@ -363,12 +528,27 @@ def translate_column_balanced(
     # Process in batches
     num_batches = (total_cells + batch_size - 1) // batch_size
 
+    # Check for existing progress
+    start_batch = 0
+    if checkpoint:
+        progress = checkpoint.get_column_progress(sheet_name, column_name, language)
+        if progress.get('completed_batches', 0) > 0:
+            start_batch = progress['completed_batches']
+            # Restore previous translations
+            prev_translations = progress.get('translations', [])
+            for i, trans in enumerate(prev_translations):
+                if i < total_cells:
+                    all_translations[i] = trans
+            logger.info(f"Resuming [{column_name}] {language} from batch {start_batch + 1}/{num_batches}")
+
     desc = f"[{column_name}] -> {language.capitalize()} (balanced)"
     progress_bar = tqdm(
-        range(num_batches),
+        range(start_batch, num_batches),
         desc=desc,
         unit="batch",
-        ncols=100
+        ncols=100,
+        initial=start_batch,
+        total=num_batches
     )
 
     for batch_idx in progress_bar:
@@ -428,6 +608,17 @@ def translate_column_balanced(
                     if batch_texts[local_idx]:
                         all_translations[global_idx] = f"[ERROR: {str(e)}]"
 
+        # Save checkpoint after each batch
+        if checkpoint:
+            checkpoint.save_batch_progress(
+                sheet_name=sheet_name,
+                column_name=column_name,
+                language=language,
+                batch_idx=batch_idx,
+                total_batches=num_batches,
+                translations=all_translations
+            )
+
     return all_translations
 
 
@@ -443,7 +634,8 @@ def process_sheet(
     kazakh_prompt: str,
     do_russian: bool = True,
     do_kazakh: bool = True,
-    chunker: Optional[BalancedChunker] = None
+    chunker: Optional[BalancedChunker] = None,
+    checkpoint: Optional[CheckpointManager] = None
 ) -> pd.DataFrame:
     """
     Process a single sheet through the translation pipeline
@@ -461,6 +653,7 @@ def process_sheet(
         do_russian: Whether to translate to Russian
         do_kazakh: Whether to translate to Kazakh
         chunker: BalancedChunker for balanced mode (None = legacy mode)
+        checkpoint: Optional CheckpointManager for saving progress
 
     Returns:
         DataFrame with translated columns
@@ -501,13 +694,15 @@ def process_sheet(
             if do_russian:
                 ru_translations = translate_column_balanced(
                     df, source_col, chunker, 'russian',
-                    ru_batch, llm_manager.translate_batch_to_russian, russian_prompt
+                    ru_batch, llm_manager.translate_batch_to_russian, russian_prompt,
+                    checkpoint=checkpoint, sheet_name=sheet_name
                 )
 
             if do_kazakh:
                 kz_translations = translate_column_balanced(
                     df, source_col, chunker, 'kazakh',
-                    kz_batch, llm_manager.translate_batch_to_kazakh, kazakh_prompt
+                    kz_batch, llm_manager.translate_batch_to_kazakh, kazakh_prompt,
+                    checkpoint=checkpoint, sheet_name=sheet_name
                 )
 
             # Store results
@@ -547,6 +742,10 @@ def process_sheet(
                 result_data[ru_col] = [c.translations.get("russian", "") for c in cells]
             if do_kazakh:
                 result_data[kz_col] = [c.translations.get("kazakh", "") for c in cells]
+
+    # Mark sheet as completed
+    if checkpoint:
+        checkpoint.mark_sheet_completed(sheet_name)
 
     return pd.DataFrame(result_data)
 
@@ -621,6 +820,14 @@ def main():
     sheets = read_excel_or_csv(args.input_file)
     logger.info(f"Found {len(sheets)} sheet(s): {list(sheets.keys())}")
 
+    # Initialize checkpoint manager
+    output_dir = config['output']['directory']
+    checkpoint = CheckpointManager(args.input_file, config, output_dir)
+    is_resuming = checkpoint.load_or_create(len(sheets), list(sheets.keys()))
+
+    if is_resuming:
+        logger.info(f"\n{checkpoint.get_summary()}\n")
+
     # Step 2: Initialize LLM clients
     logger.info("Initializing LLM clients...")
 
@@ -680,6 +887,11 @@ def main():
     use_custom_columns = args.columns is not None
 
     for sheet_name, df in sheets.items():
+        # Check if sheet is already completed
+        if checkpoint.get_sheet_status(sheet_name) == 'completed':
+            logger.info(f"\n[{sheet_name}] Already completed, skipping...")
+            continue
+
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing sheet: {sheet_name} ({len(df)} rows)")
         logger.info(f"{'='*60}")
@@ -726,7 +938,8 @@ def main():
             kazakh_prompt,
             do_russian=do_russian,
             do_kazakh=do_kazakh,
-            chunker=chunker
+            chunker=chunker,
+            checkpoint=checkpoint
         )
 
         output_sheets[sheet_name] = result_df
@@ -749,11 +962,11 @@ def main():
         input_path = Path(args.input_file)
         output_base = input_path.stem + "_translated"
 
-    output_dir = config['output']['directory']
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
     output_path = f"{output_dir}/{output_base}.xlsx"
     save_multi_sheet_excel(output_sheets, output_path)
+
+    # Clean up checkpoint after successful completion
+    checkpoint.cleanup()
 
     logger.info(f"\nPipeline completed successfully!")
     logger.info(f"Processed {len(output_sheets)} sheet(s)")
